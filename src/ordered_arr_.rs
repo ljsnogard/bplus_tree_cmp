@@ -122,22 +122,7 @@ impl<T, const N: usize> OrderedArray<T, N> {
         }
     }
 
-    pub fn search_by<'f, TyHint, TyCmp>(
-        &'f self,
-        hint: &TyHint,
-        cmp: &TyCmp,
-    ) -> Result<&'f T, Option<&'f T>>
-    where
-        TyCmp: TrComparer<T, TyHint>,
-    {
-        if self.count_ == 0 {
-            return Result::Err(Option::None);
-        } 
-        self.binary_search_(hint, cmp)
-            .map(|x| self.get_elem_at_(x))
-            .map_err(|u| Option::Some(self.get_elem_at_(u)))
-    }
-
+    /// 使用 T 自身的 Ord 作为 `try_insert_by` 的 comparer 然后调用之。
     pub fn try_insert<'f>(&'f mut self, t: T) -> TryInsertResult<'f, T>
     where
         T: Ord,
@@ -146,8 +131,21 @@ impl<T, const N: usize> OrderedArray<T, N> {
         self.try_insert_by(t, &c)
     }
 
-    /// 插入一个新元素，物理上追加至末尾，并更新逻辑顺序。
-    /// 若数组已满，返回 `Err(new_value)`。
+    /// 尝试将元素插入有序数组。
+    ///
+    /// 新元素在物理存储上追加到当前可用槽位，
+    /// 在逻辑顺序上插入到由 `cmp` 确定的位置。
+    ///
+    /// 如果数组已满，返回 `TryInsertResult::Full`。
+    ///
+    /// 如果已有元素与新元素在 `cmp` 意义下等价，
+    /// 返回 `TryInsertResult::Conflict`，同时提供：
+    /// - 已有元素的逻辑位置；
+    /// - 已有元素的可变引用；
+    /// - 未插入的新元素。
+    ///
+    /// `Conflict` 的具体处理方式由调用者决定，例如拒绝插入、
+    /// 修改已有元素或使用新元素替换已有元素的部分字段。
     pub fn try_insert_by<'f, TyCmp>(
         &'f mut self, 
         t: T,
@@ -169,21 +167,31 @@ impl<T, const N: usize> OrderedArray<T, N> {
             self.count_ += 1;
         } else {
             // 1. 在现有逻辑顺序（order[0..len]）中查找插入位置
-            let pos = match self.binary_search_(&t, c) {
-                Result::Ok(x) => x,
-                Result::Err(x) => {
-                    let conflict_phys_idx = self.order_[x];
-                    let conflict_item_mut = unsafe {
-                        self.elems_[conflict_phys_idx].assume_init_mut()
-                    };
-                    return TryInsertResult::Conflict {
-                        at: x,
-                        item: conflict_item_mut,
-                        conflict: t,
-                    };
-                }
-            };
-
+            // let pos = match self.binary_search_(&t, c) {
+            //     Result::Ok(x) => x,
+            //     Result::Err(x) => {
+            //         let conflict_phys_idx = self.order_[x];
+            //         let conflict_item_mut = unsafe {
+            //             self.elems_[conflict_phys_idx].assume_init_mut()
+            //         };
+            //         return TryInsertResult::Conflict {
+            //             at: x,
+            //             item: conflict_item_mut,
+            //             conflict: t,
+            //         };
+            //     }
+            // };
+            let curr_count = self.count_;
+            let pos = self.lower_bound_by(&t, c);
+            let lb_phyx_idx = self.order_[pos];
+            let lb = self.get_elem_mut_at_(lb_phyx_idx);
+            if pos < curr_count && c.compare(lb, &t) == Ordering::Equal {
+                return TryInsertResult::Conflict {
+                    at: pos,
+                    item: lb,
+                    conflict: t,
+                };
+            }
             // 2. 移动 order 元素以腾出位置（从后往前移动）
             //    新索引 = len（旧长度），插入后总长度变为 len+1
             self.move_insert_position_(pos, new_phys_idx);
@@ -211,30 +219,111 @@ impl<T, const N: usize> OrderedArray<T, N> {
         Option::Some(unsafe { x.assume_init_read() })
     }
 
-    /// 在现有逻辑顺序中查找新物理索引应插入的位置（二分查找）。
-    fn binary_search_<TyHint, TyCmp>(
+    /// 查找 comparer 意义下等价的元素。
+    ///
+    /// 找到时返回元素引用，否则返回 `None`。
+    pub fn find_by<Q, C>(&self, query: &Q, cmp: &C) -> Option<&T>
+    where
+        C: TrComparer<T, Q>,
+    {
+        if let Result::Ok(p) = self.binary_search_by(query, cmp) {
+            self.get_ref_at(p).ok()
+        } else {
+            Option::None
+        }
+    }
+
+    /// 使用 Comparer 对有序数组执行二分查找。
+    ///
+    /// 找到 comparer 意义下等价的元素时返回 `Ok(index)`；
+    /// 否则返回 `Err(index)`，其中 `index` 是该元素应该插入的位置。
+    pub fn binary_search_by<Q, C>(
         &self,
-        hint: &TyHint,
-        cmp: &TyCmp,
+        query: &Q,
+        cmp: &C,
     ) -> Result<usize, usize>
     where
-        TyCmp: TrComparer<T, TyHint>,
+        C: TrComparer<T, Q>,
+    {
+        let pos = self.lower_bound_by(query, cmp);
+        let lb_phyx_idx = self.order_[pos];
+        let lb = self.get_elem_at_(lb_phyx_idx);
+        if pos < self.count_ && cmp.compare(lb, query) == Ordering::Equal {
+            Ok(pos)
+        } else {
+            Err(pos)
+        }
+    }
+
+    /// 寻找第一个满足 elem >= query 的位置
+    pub fn lower_bound_by<Q, C>(&self, query: &Q, cmp: &C) -> usize
+    where
+        C: TrComparer<T, Q>,
+    {
+        self.partition_point_(|elem| {
+            cmp.compare(elem, query) == Ordering::Less
+        })
+    }
+
+    /// 寻找第一个满足 elem > query 的位置
+    pub fn upper_bound_by<Q, C>(&self, query: &Q, cmp: &C) -> usize
+    where
+        C: TrComparer<T, Q>,
+    {
+        self.partition_point_(|elem| {
+            matches!(
+                cmp.compare(elem, query),
+                Ordering::Less | Ordering::Equal
+            )
+        })
+    }
+
+    /// 返回 [0, count_) 中第一个使 pred 返回 false 的位置。
+    fn partition_point_<P>(&self, mut pred: P) -> usize
+    where
+        P: FnMut(&T) -> bool,
     {
         let mut left = 0;
-        let mut right = self.count_; // 当前有效逻辑长度
+        let mut right = self.count_;
+
         while left < right {
-            let mid = (left + right) / 2;
-            let mid_phys = self.order_[mid];
-            let mid_val = self.get_elem_at_(mid_phys);
-            let ordering = cmp.compare(mid_val, hint);
-            match ordering {
-                Ordering::Less => left = mid + 1,
-                Ordering::Greater => right = mid,
-                Ordering::Equal => return Result::Err(mid),
+            let mid = left + (right - left) / 2;
+            let elem = self.get_elem_at_(self.order_[mid]);
+
+            if pred(elem) {
+                left = mid + 1;
+            } else {
+                right = mid;
             }
         }
-        Result::Ok(left)
+
+        left
     }
+
+    // /// 在现有逻辑顺序中查找新物理索引应插入的位置（二分查找）。
+    // fn binary_search_<TyHint, TyCmp>(
+    //     &self,
+    //     hint: &TyHint,
+    //     cmp: &TyCmp,
+    // ) -> Result<usize, usize>
+    // where
+    //     TyCmp: TrComparer<T, TyHint>,
+    // {
+    //     let mut left = 0;
+    //     let mut right = self.count_; // 当前有效逻辑长度
+    //     while left < right {
+    //         let mid = (left + right) / 2;
+    //         let mid_phys = self.order_[mid];
+    //         let mid_val = self.get_elem_at_(mid_phys);
+    //         let ordering = cmp.compare(mid_val, hint);
+    //         match ordering {
+    //             Ordering::Less => left = mid + 1,
+    //             Ordering::Greater => right = mid,
+    //             Ordering::Equal => return Result::Err(mid),
+    //         }
+    //     }
+    //     Result::Ok(left)
+    // }
 
     fn move_insert_position_(&mut self, i: usize, p: usize) {
         for i in (i..self.count_).rev() {
@@ -243,11 +332,11 @@ impl<T, const N: usize> OrderedArray<T, N> {
         self.order_[i] = p;
     }
 
-    fn get_elem_at_<'f>(&'f self, p: usize) -> &'f T {
+    fn get_elem_at_(&self, p: usize) -> &T {
         unsafe { self.elems_[p].assume_init_ref() }
     }
 
-    fn get_elem_mut_at_<'f>(&'f mut self, p: usize) -> &'f mut T {
+    fn get_elem_mut_at_(&mut self, p: usize) -> &mut T {
         unsafe { self.elems_[p].assume_init_mut() }
     }
 }
@@ -478,5 +567,209 @@ mod tests_drop_ {
                 i
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_search_ {
+    use super::*;
+
+    #[test]
+    fn test_partition_point() {
+        let mut arr = OrderedArray::<i32, 8>::new();
+
+        for x in [10, 20, 30, 40, 50] {
+            assert!(arr.try_insert(x).is_succ());
+        }
+
+        // [10, 20, 30, 40, 50]
+
+        assert_eq!(arr.partition_point_(|x| *x < 0), 0);
+        assert_eq!(arr.partition_point_(|x| *x < 10), 0);
+        assert_eq!(arr.partition_point_(|x| *x < 20), 1);
+        assert_eq!(arr.partition_point_(|x| *x < 30), 2);
+        assert_eq!(arr.partition_point_(|x| *x < 40), 3);
+        assert_eq!(arr.partition_point_(|x| *x < 50), 4);
+        assert_eq!(arr.partition_point_(|x| *x < 60), 5);
+
+        // partition_point 可以表达“<= query”
+        assert_eq!(arr.partition_point_(|x| *x <= 30), 3);
+        assert_eq!(arr.partition_point_(|x| *x <= 50), 5);
+    }
+
+    #[test]
+    fn test_lower_bound_by() {
+        let mut arr = OrderedArray::<i32, 8>::new();
+
+        for x in [10, 20, 30, 40, 50] {
+            assert!(arr.try_insert(x).is_succ());
+        }
+
+        let cmp = OrdComparer::new();
+
+        // 第一个 >= query
+        assert_eq!(arr.lower_bound_by(&0, &cmp), 0);
+        assert_eq!(arr.lower_bound_by(&10, &cmp), 0);
+        assert_eq!(arr.lower_bound_by(&15, &cmp), 1);
+        assert_eq!(arr.lower_bound_by(&20, &cmp), 1);
+        assert_eq!(arr.lower_bound_by(&25, &cmp), 2);
+        assert_eq!(arr.lower_bound_by(&30, &cmp), 2);
+        assert_eq!(arr.lower_bound_by(&45, &cmp), 4);
+        assert_eq!(arr.lower_bound_by(&50, &cmp), 4);
+        assert_eq!(arr.lower_bound_by(&60, &cmp), 5);
+    }
+
+    #[test]
+    fn test_upper_bound_by() {
+        let mut arr = OrderedArray::<i32, 8>::new();
+
+        for x in [10, 20, 30, 40, 50] {
+            assert!(arr.try_insert(x).is_succ());
+        }
+
+        let cmp = OrdComparer::new();
+
+        // 第一个 > query
+        assert_eq!(arr.upper_bound_by(&0, &cmp), 0);
+        assert_eq!(arr.upper_bound_by(&10, &cmp), 1);
+        assert_eq!(arr.upper_bound_by(&15, &cmp), 1);
+        assert_eq!(arr.upper_bound_by(&20, &cmp), 2);
+        assert_eq!(arr.upper_bound_by(&25, &cmp), 2);
+        assert_eq!(arr.upper_bound_by(&30, &cmp), 3);
+        assert_eq!(arr.upper_bound_by(&45, &cmp), 4);
+        assert_eq!(arr.upper_bound_by(&50, &cmp), 5);
+        assert_eq!(arr.upper_bound_by(&60, &cmp), 5);
+    }
+
+    #[test]
+    fn test_binary_search_by() {
+        let mut arr = OrderedArray::<i32, 8>::new();
+
+        for x in [10, 20, 30, 40, 50] {
+            assert!(arr.try_insert(x).is_succ());
+        }
+
+        let cmp = OrdComparer::new();
+
+        // 找到
+        assert_eq!(arr.binary_search_by(&10, &cmp), Ok(0));
+        assert_eq!(arr.binary_search_by(&20, &cmp), Ok(1));
+        assert_eq!(arr.binary_search_by(&30, &cmp), Ok(2));
+        assert_eq!(arr.binary_search_by(&40, &cmp), Ok(3));
+        assert_eq!(arr.binary_search_by(&50, &cmp), Ok(4));
+
+        // 找不到，同时返回 lower_bound / 插入位置
+        assert_eq!(arr.binary_search_by(&0, &cmp), Err(0));
+        assert_eq!(arr.binary_search_by(&15, &cmp), Err(1));
+        assert_eq!(arr.binary_search_by(&25, &cmp), Err(2));
+        assert_eq!(arr.binary_search_by(&35, &cmp), Err(3));
+        assert_eq!(arr.binary_search_by(&45, &cmp), Err(4));
+        assert_eq!(arr.binary_search_by(&60, &cmp), Err(5));
+    }
+
+    #[test]
+    fn test_binary_search_matches_lower_bound() {
+        let mut arr = OrderedArray::<i32, 8>::new();
+
+        for x in [10, 20, 30, 40, 50] {
+            assert!(arr.try_insert(x).is_succ());
+        }
+
+        let cmp = OrdComparer::new();
+
+        for query in [-10, 0, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60] {
+            let lower = arr.lower_bound_by(&query, &cmp);
+
+            match arr.binary_search_by(&query, &cmp) {
+                Ok(pos) => {
+                    assert_eq!(pos, lower);
+                    assert_eq!(*arr.get_ref_at(pos).unwrap(), query);
+                }
+                Err(pos) => {
+                    assert_eq!(pos, lower);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_search_empty() {
+        let arr = OrderedArray::<i32, 8>::new();
+        let cmp = OrdComparer::new();
+
+        assert_eq!(arr.len(), 0);
+
+        assert_eq!(arr.partition_point_(|_| true), 0);
+        assert_eq!(arr.partition_point_(|_| false), 0);
+
+        assert_eq!(arr.lower_bound_by(&10, &cmp), 0);
+        assert_eq!(arr.upper_bound_by(&10, &cmp), 0);
+        assert_eq!(arr.binary_search_by(&10, &cmp), Err(0));
+        assert_eq!(arr.find_by(&10, &cmp), None);
+    }
+}
+
+#[cfg(test)]
+mod tests_heter_search_ {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct TupleKeyComparer;
+
+    impl TrComparer<(u64, &'static str), u64> for TupleKeyComparer {
+        fn compare(
+            &self,
+            value: &(u64, &'static str),
+            query: &u64,
+        ) -> Ordering {
+            value.0.cmp(query)
+        }
+    }
+
+    #[test]
+    fn test_heterogeneous_search() {
+        let mut arr = OrderedArray::<(u64, &'static str), 8>::new();
+
+        // let insert_cmp = OrdComparer::new();
+
+        // 如果这里使用 tuple 的 Ord，只是为了方便建立测试数据。
+        assert!(arr.try_insert((10, "ten")).is_succ());
+        assert!(arr.try_insert((20, "twenty")).is_succ());
+        assert!(arr.try_insert((30, "thirty")).is_succ());
+        assert!(arr.try_insert((40, "forty")).is_succ());
+
+        let cmp = TupleKeyComparer;
+
+        assert_eq!(arr.lower_bound_by(&5u64, &cmp), 0);
+        assert_eq!(arr.lower_bound_by(&10u64, &cmp), 0);
+        assert_eq!(arr.lower_bound_by(&15u64, &cmp), 1);
+        assert_eq!(arr.lower_bound_by(&20u64, &cmp), 1);
+        assert_eq!(arr.lower_bound_by(&25u64, &cmp), 2);
+        assert_eq!(arr.lower_bound_by(&40u64, &cmp), 3);
+        assert_eq!(arr.lower_bound_by(&50u64, &cmp), 4);
+
+        assert_eq!(arr.upper_bound_by(&10u64, &cmp), 1);
+        assert_eq!(arr.upper_bound_by(&20u64, &cmp), 2);
+        assert_eq!(arr.upper_bound_by(&40u64, &cmp), 4);
+
+        assert_eq!(
+            arr.binary_search_by(&20u64, &cmp),
+            Ok(1)
+        );
+
+        assert_eq!(
+            arr.binary_search_by(&25u64, &cmp),
+            Err(2)
+        );
+
+        assert_eq!(
+            arr.find_by(&30u64, &cmp),
+            Some(&(30, "thirty"))
+        );
+
+        assert_eq!(
+            arr.find_by(&35u64, &cmp),
+            None
+        );
     }
 }
