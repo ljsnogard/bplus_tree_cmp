@@ -5,8 +5,6 @@ use crate::{
     ordered_arr_::OrderedArray,
 };
 
-
-
 pub type OrdDataIdArr<T, const M: usize> = OrderedArray<Idx<T>, M>;
 pub type TreeNodeId<T, const M: usize> = Idx<TreeNode<T, M>>;
 

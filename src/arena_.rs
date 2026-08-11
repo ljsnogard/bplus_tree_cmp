@@ -26,10 +26,10 @@ impl<T> Arena<T> {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub struct Idx<T> {
     index_: usize,
-    _t_: PhantomData<T>,
+    _t_: PhantomData<fn() -> T>,
 }
 
 impl<T> Idx<T> {
@@ -54,6 +54,23 @@ impl<T> Idx<T> {
         &mut arena.slab_[self.index_]
     }
 }
+
+impl<T> Copy for Idx<T> {}
+
+impl<T> Clone for Idx<T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> PartialEq for Idx<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.index_ == other.index_
+    }
+}
+
+impl<T> Eq for Idx<T> {}
 
 /// 同构定序，两个要定序的目标位于同一个 Arena
 pub struct HomoIdxComparer<'a, T, C>
