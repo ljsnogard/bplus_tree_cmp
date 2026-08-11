@@ -65,6 +65,7 @@ impl<'a, T> TryInsertResult<'a, T> {
     }
 }
 
+#[derive(Debug)]
 pub struct OrderedArray<T, const N: usize> {
     elems_: [MaybeUninit<T>; N],
     order_: [usize; N],
@@ -260,8 +261,8 @@ impl<T, const N: usize> OrderedArray<T, N> {
     where
         C: TrComparer<T, Q>,
     {
-        self.partition_point_(|elem| {
-            cmp.compare(elem, query) == Ordering::Less
+        self.partition_point_(query, |elem, hint| {
+            cmp.compare(elem, hint) == Ordering::Less
         })
     }
 
@@ -270,18 +271,22 @@ impl<T, const N: usize> OrderedArray<T, N> {
     where
         C: TrComparer<T, Q>,
     {
-        self.partition_point_(|elem| {
+        self.partition_point_(query,|elem, hint| {
             matches!(
-                cmp.compare(elem, query),
+                cmp.compare(elem, hint),
                 Ordering::Less | Ordering::Equal
             )
         })
     }
 
     /// 返回 [0, count_) 中第一个使 pred 返回 false 的位置。
-    fn partition_point_<P>(&self, mut pred: P) -> usize
+    fn partition_point_<Q, P>(
+        &self,
+        query: &Q,
+        mut pred: P,
+    ) -> usize
     where
-        P: FnMut(&T) -> bool,
+        P: FnMut(&T, &Q) -> bool,
     {
         let mut left = 0;
         let mut right = self.count_;
@@ -290,13 +295,12 @@ impl<T, const N: usize> OrderedArray<T, N> {
             let mid = left + (right - left) / 2;
             let elem = self.get_elem_at_(self.order_[mid]);
 
-            if pred(elem) {
+            if pred(elem, query) {
                 left = mid + 1;
             } else {
                 right = mid;
             }
         }
-
         left
     }
 
@@ -583,18 +587,20 @@ mod tests_search_ {
         }
 
         // [10, 20, 30, 40, 50]
+        let pred_lt = |x: &i32, q: &i32| x < q;
+        let pred_ngt = |x: &i32, q: &i32| x <= q;
 
-        assert_eq!(arr.partition_point_(|x| *x < 0), 0);
-        assert_eq!(arr.partition_point_(|x| *x < 10), 0);
-        assert_eq!(arr.partition_point_(|x| *x < 20), 1);
-        assert_eq!(arr.partition_point_(|x| *x < 30), 2);
-        assert_eq!(arr.partition_point_(|x| *x < 40), 3);
-        assert_eq!(arr.partition_point_(|x| *x < 50), 4);
-        assert_eq!(arr.partition_point_(|x| *x < 60), 5);
+        assert_eq!(arr.partition_point_(&0, pred_lt), 0);
+        assert_eq!(arr.partition_point_(&10, pred_lt), 0);
+        assert_eq!(arr.partition_point_(&20, pred_lt), 1);
+        assert_eq!(arr.partition_point_(&30, pred_lt), 2);
+        assert_eq!(arr.partition_point_(&40, pred_lt), 3);
+        assert_eq!(arr.partition_point_(&50, pred_lt), 4);
+        assert_eq!(arr.partition_point_(&60, pred_lt), 5);
 
         // partition_point 可以表达“<= query”
-        assert_eq!(arr.partition_point_(|x| *x <= 30), 3);
-        assert_eq!(arr.partition_point_(|x| *x <= 50), 5);
+        assert_eq!(arr.partition_point_(&30, &pred_ngt), 3);
+        assert_eq!(arr.partition_point_(&50, &pred_ngt), 5);
     }
 
     #[test]
@@ -699,8 +705,8 @@ mod tests_search_ {
 
         assert_eq!(arr.len(), 0);
 
-        assert_eq!(arr.partition_point_(|_| true), 0);
-        assert_eq!(arr.partition_point_(|_| false), 0);
+        assert_eq!(arr.partition_point_(&0, |_, _| true), 0);
+        assert_eq!(arr.partition_point_(&0, |_, _| false), 0);
 
         assert_eq!(arr.lower_bound_by(&10, &cmp), 0);
         assert_eq!(arr.upper_bound_by(&10, &cmp), 0);

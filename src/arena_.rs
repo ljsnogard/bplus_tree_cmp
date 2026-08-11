@@ -89,7 +89,7 @@ where
 }
 
 /// 异构定序，两个要定序的目标位于不同的 Arena
-pub struct HeterIdxComparer<'a, L, R, C>
+pub struct HeteroIdxComparer<'a, L, R, C>
 where
     C: TrComparer<L, R>,
 {
@@ -98,7 +98,7 @@ where
     arena_r_: &'a Arena<R>,
 }
 
-impl<'a, L, R, C> HeterIdxComparer<'a, L, R, C>
+impl<'a, L, R, C> HeteroIdxComparer<'a, L, R, C>
 where
     C: TrComparer<L, R>,
 {
@@ -107,7 +107,7 @@ where
         arena_lhs: &'a Arena<L>,
         arena_rhs: &'a Arena<R>,
     ) -> Self {
-        HeterIdxComparer {
+        HeteroIdxComparer {
             comparer_: comparer,
             arena_l_: arena_lhs,
             arena_r_: arena_rhs,
@@ -115,7 +115,7 @@ where
     }
 }
 
-impl<'a, L, R, C> TrComparer<Idx<L>, Idx<R>> for HeterIdxComparer<'a, L, R, C>
+impl<'a, L, R, C> TrComparer<Idx<L>, Idx<R>> for HeteroIdxComparer<'a, L, R, C>
 where
     C: TrComparer<L, R>,
 {

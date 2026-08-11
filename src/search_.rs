@@ -8,89 +8,81 @@ use crate::{
     }
 };
 
-pub fn search_resursive<'f, T, H, C, const M: usize>(
+/// 从某一个给定的节点开始进行递归搜索，返回第一个使 pred 返回 false 的位置。
+/// 且该位置应为 DataLeaf （如果非空）或者 node_idx （如果空节点，例如当
+/// 树刚刚构建，完全没有任何节点没有 Root 的情况下）
+/// Pred 的语义应该
+pub fn partition_point_resursive_<'f, T, H, P, const M: usize>(
     node_idx: &'f TreeNodeId<T, M>,
     arena: &'f Arena<TreeNode<T, M>>,
     hint: &'f H,
-    cmp: &'f C,
-) -> Result<&'f DataLeaf<T, M>, TreeNodeId<T, M>>
+    pred: P,
+) -> TreeNodeId<T, M>
 where
-    C: TrComparer<T, H>,
+    P: FnMut(&T, &H) -> bool,
 {
     let node = node_idx.get(arena);
     match node {
-        TreeNode::Index(index) => search_index(index, arena, hint, cmp),
-        TreeNode::Leaf(leaf) => search_leaf(leaf, arena, hint, cmp),
-        TreeNode::Root(root) => search_root(root, node_idx, arena, hint, cmp),
+        TreeNode::Index(index) =>
+            partition_point_from_index_(
+                index,
+                arena,
+                hint,
+                pred,
+            ),
+        TreeNode::Leaf(leaf) =>
+            partition_point_from_leaf(
+                leaf,
+                arena,
+                hint,
+                pred,
+            ),
+        TreeNode::Root(root) =>
+            partition_point_from_root(
+                root,
+                node_idx,
+                arena,
+                hint,
+                pred,
+            ),
     }
 }
 
-fn search_index<'f, T, H, C, const M: usize>(
+/// 从 IndexNode 开始进行递归搜索，返回第一个使 pred 返回 false 的位置。
+/// 且该位置应为 DataLeaf （如果非空）或者 node_idx （如果空节点）
+fn partition_point_from_index_<'f, T, H, P, const M: usize>(
     index: &'f IndexNode<T, M>,
     arena: &'f Arena<TreeNode<T, M>>,
     hint: &'f H,
-    cmp: &'f C,
-) -> Result<&'f DataLeaf<T, M>, TreeNodeId<T, M>>
+    mut pred: P,
+) -> TreeNodeId<T, M>
 where
-    C: TrComparer<T, H>,
+    P: FnMut(&T, &H) -> bool,
 {
     todo!()
 }
 
-fn search_leaf<'f, T, H, C, const M: usize>(
+fn partition_point_from_leaf<'f, T, H, P, const M: usize>(
     leaf: &'f DataLeaf<T, M>,
     arena: &'f Arena<TreeNode<T, M>>,
     hint: &'f H,
-    cmp: &'f C,
-) -> Result<&'f DataLeaf<T, M>, TreeNodeId<T, M>>
+    mut pred: P,
+) -> TreeNodeId<T, M>
 where
-    C: TrComparer<T, H>,
+    P: FnMut(&T, &H) -> bool,
 {
     todo!()
 }
 
-fn search_root<'f, T, H, C, const M: usize>(
+fn partition_point_from_root<'f, T, H, P, const M: usize>(
     root: &'f RootNode<T, M>,
     root_idx: &'f TreeNodeId<T, M>,
     arena: &'f Arena<TreeNode<T, M>>,
     hint: &'f H,
-    cmp: &'f C,
-) -> Result<&'f DataLeaf<T, M>, TreeNodeId<T, M>>
+    mut pred: P,
+) -> TreeNodeId<T, M>
 where
-    C: TrComparer<T, H>,
+    P: FnMut(&T, &H) -> bool,
 {
-    // let idx_cmp = HomoIdxComparer::new(cmp, arena);
-    // let x = root.children_.search_by(hint, &idx_cmp);
-    // if let Result::Ok(id) = x {
-    //     return search_resursive(id, arena, hint, cmp)
-    // }
-    // let Result::Err(err) = x  else{
-    //     unreachable!()
-    // };
-    // let Option::Some(idx) = err else {
-    //     return Result::Err(root_idx);
-    // };
     todo!()
-}
-
-struct DataIdxHeterComparer<'a, L, R, C>
-where
-    C: TrComparer<L>,
-{
-    cmp_: &'a C,
-    arena_: &'a Arena<R>,
-    _mark_: PhantomData<&'a L>,
-}
-
-impl<'a, L, R, C> DataIdxHeterComparer<'a, L, R, C>
-where
-    C: TrComparer<L>,
-{
-    pub const fn new(comparer: &'a C, arena: &'a Arena<R>) -> Self {
-        DataIdxHeterComparer {
-            cmp_: comparer,
-            arena_: arena,
-            _mark_: PhantomData,
-        }
-    }
 }
