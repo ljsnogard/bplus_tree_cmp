@@ -30,7 +30,7 @@ where
     }
 }
 
-impl<T> TrComparer<T, T> for OrdComparer<T>
+impl<T> TrComparer<T> for OrdComparer<T>
 where
     T: ?Sized + Ord,
 {
@@ -50,5 +50,32 @@ where
     fn compare(&self, a: &A, b: &B) -> Ordering {
         let f = self;
         f(a, b)
+    }
+}
+
+pub struct PairAdaptComparer<'a, T, C>
+where
+    C: TrComparer<T>,
+{
+    t_cmp_: &'a C,
+    _t_: PhantomData<fn(&'a T) -> Ordering>,
+}
+
+impl<'a, T, C> PairAdaptComparer<'a, T, C>
+where
+    C: TrComparer<T>,
+{
+    pub const fn new(cmp: &'a C) -> Self {
+        PairAdaptComparer { t_cmp_: cmp, _t_: PhantomData }
+    }
+}
+
+impl<'a, T, C> TrComparer<(T, ())> for PairAdaptComparer<'a, T, C>
+where
+    C: TrComparer<T>,
+{
+    #[inline]
+    fn compare(&self, a: &(T, ()), b: &(T, ())) -> Ordering {
+        self.t_cmp_.compare(&a.0, &b.0)
     }
 }

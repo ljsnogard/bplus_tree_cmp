@@ -1,10 +1,18 @@
 use core::{
     cmp::Ordering,
+    marker::PhantomData,
     mem::MaybeUninit,
     ptr,
 };
 
-use crate::{IntoPair, OrdComparer, comparer_::TrComparer};
+use crate::comparer_::{OrdComparer, TrComparer};
+
+//-----------------------------------------------------------------------------
+// About Insert conflict.
+// Because OrderedArray is not designed to be an independant
+// container but an helper type to simplify code in B+ tree. So it leaves the
+// conflict by the upper layer user to decide what to do with insert conflict.
+//-----------------------------------------------------------------------------
 
 #[derive(Debug)]
 pub struct ConflictInfo<'a, K, V = ()> {
@@ -70,6 +78,10 @@ impl<'a, K, V> TryInsertResult<'a, K, V> {
     }
 }
 
+//-----------------------------------------------------------------------------
+// OrderedArray
+//-----------------------------------------------------------------------------
+
 #[derive(Debug)]
 pub struct OrderedArray<const N: usize, K, V = ()> {
     elems_: [MaybeUninit<(K, V)>; N],
@@ -119,6 +131,18 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
         }
     }
 
+    pub fn first(&self) -> Option<(&K, &V)> {
+        self.get_ref_at(0usize).ok()
+    }
+
+    pub fn last(&self) -> Option<(&K, &V)> {
+        if self.count_ > 0 {
+            self.get_ref_at(self.count_ - 1).ok()
+        } else {
+            Option::None
+        }
+    }
+
     /// 返回逻辑顺序的迭代器，产生元素引用。
     pub fn iter(&self) -> Iter<'_, N, K, V> {
         Iter {
@@ -140,16 +164,17 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
         self.try_insert_by(hint, &c, factory)
     }
 
-    pub fn try_insert_item_by<'f, TyCmp>(
+    /// Insert a pair of (K, V), by the comparer on K.
+    pub fn try_insert_pair_by<'f, TyCmp>(
         &'f mut self,
-        item: (K, V),
+        pair: (K, V),
         cmp: &TyCmp,
     ) -> TryInsertResult<'f, K, V>
     where
         TyCmp: TrComparer<K>,
     {
         if self.count_ >= N {
-            return TryInsertResult::Full(ConflictItem::Pair(item))
+            return TryInsertResult::Full(ConflictItem::Pair(pair))
         }
         // 0. 获得物理写入位置的索引
         let new_phys_idx = self.order_[self.count_];
@@ -157,12 +182,12 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
             for i in 0..N {
                 self.order_[i] = i
             }
-            self.elems_[0].write(item);
+            self.elems_[0].write(pair);
             self.count_ += 1;
         } else {
             // 1. 在现有逻辑顺序（order[0..len]）中查找插入位置
             let curr_count = self.count_;
-            let (hint, _) = &item;
+            let (hint, _) = &pair;
             let pos = self.lower_bound_by(hint, cmp);
             if pos < curr_count {
                 let lb_phyx_idx = self.order_[pos];
@@ -172,7 +197,7 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
                     return TryInsertResult::Conflict(ConflictInfo {
                         at: pos,
                         existing: (k as &_, v),
-                        conflict: ConflictItem::Pair(item),
+                        conflict: ConflictItem::Pair(pair),
                     });
                 }
             }
@@ -181,7 +206,7 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
             self.move_insert_position_(pos, new_phys_idx);
 
             // 3. 将新元素写入物理存储的末尾（索引 = 当前长度）
-            self.elems_[new_phys_idx].write(item);
+            self.elems_[new_phys_idx].write(pair);
             // 4. 更新长度
             self.count_ += 1;
         }
@@ -376,16 +401,35 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
     }
 }
 
-impl<const N: usize, T> OrderedArray<N, T, ()>
-where
-    T: Ord + IntoPair,
-{
-    pub fn try_insert_item<'f>(
+impl<const N: usize, T> OrderedArray<N, T, ()> {
+    /// A convenient method that auto expands the item into a pair of (item, ())
+    /// and then call `try_insert_pair_by`
+    pub fn try_insert_item<'f, TyCmp>(
         &'f mut self,
         item: T,
+        cmp: &TyCmp,
+    ) -> TryInsertResult<'f, T, ()>
+    where
+        TyCmp: TrComparer<T>,
+    {
+        let pair = (item, ());
+        self.try_insert_pair_by(pair, cmp)
+    }
+}
+
+impl<const N: usize, T> OrderedArray<N, T, ()>
+where
+    T: Ord,
+{
+    /// A convenient method that ASSUMING the array using the OrdComparer or
+    /// one of its compatible comparers, and then call `try_insert_pair_by`.
+    pub fn try_insert_ord<'f>(
+        &'f mut self,
+        ord: T,
     ) -> TryInsertResult<'f, T, ()> {
         let cmp = OrdComparer::new();
-        self.try_insert_item_by(item.into_pair(), &cmp)
+        let pair = (ord, ());
+        self.try_insert_pair_by(pair, &cmp)
     }
 }
 
@@ -416,6 +460,10 @@ impl<const N: usize, K, V> Drop for OrderedArray<N, K, V> {
     }
 }
 
+//-----------------------------------------------------------------------------
+// Iterator for OrderedArray
+//-----------------------------------------------------------------------------
+
 /// 迭代器：按逻辑顺序遍历元素。
 pub struct Iter<'a, const N: usize, K, V> {
     array: &'a OrderedArray<N, K, V>,
@@ -436,6 +484,29 @@ impl<'a, const N: usize, K, V> Iterator for Iter<'a, N, K, V> {
     }
 }
 
+//-----------------------------------------------------------------------------
+// Codes related to unit testings
+//-----------------------------------------------------------------------------
+
+#[cfg(test)]
+pub(crate) fn from_test_items_by_<const M: usize, C, K, V>(
+    items: impl core::iter::IntoIterator<Item = (K, V)>,
+    cmp: &C,
+) -> OrderedArray<M, K, V>
+where
+    K: Clone,
+    C: TrComparer<K>,
+{
+    let mut it = items.into_iter();
+    let mut arr = OrderedArray::<M, K, V>::new();
+    while let Option::Some(t) = it.next() {
+        let (k, v) = t;
+        let x = arr.try_insert_by(&k, cmp, |_| (k.clone(), v));
+        assert!(x.is_full());
+    }
+    arr
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -450,12 +521,12 @@ mod tests {
     fn test_insert_and_order() {
         // let c = OrdComparer::default();
         let mut arr = OrderedArray::<5, i32>::default();
-        assert!(arr.try_insert_item(3).is_succ());
-        assert!(arr.try_insert_item(1).is_succ());
-        assert!(arr.try_insert_item(4).is_succ());
-        assert!(arr.try_insert_item(2).is_succ());
+        assert!(arr.try_insert_ord(3).is_succ());
+        assert!(arr.try_insert_ord(1).is_succ());
+        assert!(arr.try_insert_ord(4).is_succ());
+        assert!(arr.try_insert_ord(2).is_succ());
 
-        let conflict = arr.try_insert_item(1);
+        let conflict = arr.try_insert_ord(1);
         assert!(conflict.is_conflict());
         let TryInsertResult::Conflict(x)= conflict else {
             unreachable!()
@@ -475,9 +546,9 @@ mod tests {
     fn test_full() {
         // let c = OrdComparer::default();
         let mut arr = OrderedArray::<2, i32>::default();
-        assert!(arr.try_insert_item(10).is_succ());
-        assert!(arr.try_insert_item(20).is_succ());
-        assert!(arr.try_insert_item(30).is_full());
+        assert!(arr.try_insert_ord(10).is_succ());
+        assert!(arr.try_insert_ord(20).is_succ());
+        assert!(arr.try_insert_ord(30).is_full());
     }
 
     #[test]
@@ -487,9 +558,9 @@ mod tests {
         }
 
         let mut arr = OrderedArray::<4, String>::default();
-        assert!(arr.try_insert_item("b".to_string()).is_succ());
-        assert!(arr.try_insert_item("a".to_string()).is_succ());
-        assert!(arr.try_insert_item("c".to_string()).is_succ());
+        assert!(arr.try_insert_ord("b".to_string()).is_succ());
+        assert!(arr.try_insert_ord("a".to_string()).is_succ());
+        assert!(arr.try_insert_ord("c".to_string()).is_succ());
         assert_eq!(arr.get_ref_at(0).map(map_as_str), Ok("a"));
         assert_eq!(arr.get_ref_at(1).map(map_as_str), Ok("b"));
         assert_eq!(arr.get_ref_at(2).map(map_as_str), Ok("c"));
@@ -505,10 +576,10 @@ mod tests {
         let mut arr = OrderedArray::<10, i32>::default();
         // let cmp = OrdComparer::new();
 
-        arr.try_insert_item(5);
-        arr.try_insert_item(2);
-        arr.try_insert_item(8);
-        arr.try_insert_item(1); // 当前顺序 [1, 2, 5, 8]
+        arr.try_insert_ord(5);
+        arr.try_insert_ord(2);
+        arr.try_insert_ord(8);
+        arr.try_insert_ord(1); // 当前顺序 [1, 2, 5, 8]
 
         let removed = arr.try_remove_last();
         assert_eq!(removed, Some((8, ())));
@@ -539,10 +610,10 @@ mod tests {
         // let cmp = OrdComparer::new();
 
         // 插入 [3, 1, 4, 5] → 逻辑顺序 [1, 3, 4, 5]
-        arr.try_insert_item(3);
-        arr.try_insert_item(1);
-        arr.try_insert_item(4);
-        arr.try_insert_item(5);
+        arr.try_insert_ord(3);
+        arr.try_insert_ord(1);
+        arr.try_insert_ord(4);
+        arr.try_insert_ord(5);
         assert_eq!(arr.len(), 4);
 
         // 删除最大值 5
@@ -551,7 +622,7 @@ mod tests {
         // 当前逻辑顺序 [1, 3, 4]
 
         // 插入 2 → 期望 [1, 2, 3, 4]
-        arr.try_insert_item(2);
+        arr.try_insert_ord(2);
         let collected: Vec<i32> = arr
             .iter()
             .map(select_key)
@@ -562,7 +633,7 @@ mod tests {
         // 删除最大值 4
         assert_eq!(arr.try_remove_last(), Some((4, ())));
         // 插入 6 → 期望 [1, 2, 3, 6]
-        arr.try_insert_item(6);
+        arr.try_insert_ord(6);
         let collected: Vec<i32> = arr
             .iter()
             .map(select_key)
@@ -606,7 +677,7 @@ mod tests_drop_ {
             for i in 0..10 {
                 let arc = Arc::new(i);
                 weak_vec.push(Arc::downgrade(&arc)); // 插入前获取 Weak
-                let res = arr.try_insert_item_by(arc.into_pair(), &cmp);
+                let res = arr.try_insert_pair_by((arc, ()), &cmp);
                 assert!(matches!(res, TryInsertResult::Succ(_)));
             }
             // arr 在此作用域结束时被 drop
@@ -633,7 +704,7 @@ mod tests_search_ {
         let mut arr = OrderedArray::<8, i32>::new();
 
         for x in [10, 20, 30, 40, 50] {
-            assert!(arr.try_insert_item(x).is_succ());
+            assert!(arr.try_insert_ord(x).is_succ());
         }
 
         // [10, 20, 30, 40, 50]
@@ -658,7 +729,7 @@ mod tests_search_ {
         let mut arr = OrderedArray::<8, i32>::new();
 
         for x in [10, 20, 30, 40, 50] {
-            assert!(arr.try_insert_item(x).is_succ());
+            assert!(arr.try_insert_ord(x).is_succ());
         }
 
         let cmp = OrdComparer::new();
@@ -680,7 +751,7 @@ mod tests_search_ {
         let mut arr = OrderedArray::<8, i32>::new();
 
         for x in [10, 20, 30, 40, 50] {
-            assert!(arr.try_insert_item(x).is_succ());
+            assert!(arr.try_insert_ord(x).is_succ());
         }
 
         let cmp = OrdComparer::new();
@@ -702,7 +773,7 @@ mod tests_search_ {
         let mut arr = OrderedArray::<8, i32>::new();
 
         for x in [10, 20, 30, 40, 50] {
-            assert!(arr.try_insert_item(x).is_succ());
+            assert!(arr.try_insert_ord(x).is_succ());
         }
 
         let cmp = OrdComparer::new();
@@ -728,7 +799,7 @@ mod tests_search_ {
         let mut arr = OrderedArray::<8, i32>::new();
 
         for x in [10, 20, 30, 40, 50] {
-            assert!(arr.try_insert_item(x).is_succ());
+            assert!(arr.try_insert_ord(x).is_succ());
         }
 
         let cmp = OrdComparer::new();
@@ -790,10 +861,10 @@ mod tests_heter_search_ {
         // let insert_cmp = OrdComparer::new();
 
         // 如果这里使用 tuple 的 Ord，只是为了方便建立测试数据。
-        assert!(arr.try_insert_item((10, "ten")).is_succ());
-        assert!(arr.try_insert_item((20, "twenty")).is_succ());
-        assert!(arr.try_insert_item((30, "thirty")).is_succ());
-        assert!(arr.try_insert_item((40, "forty")).is_succ());
+        assert!(arr.try_insert_ord((10, "ten")).is_succ());
+        assert!(arr.try_insert_ord((20, "twenty")).is_succ());
+        assert!(arr.try_insert_ord((30, "thirty")).is_succ());
+        assert!(arr.try_insert_ord((40, "forty")).is_succ());
 
         let cmp = TupleKeyComparer;
 

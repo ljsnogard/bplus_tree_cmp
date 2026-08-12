@@ -40,7 +40,11 @@ impl<T> Idx<T> {
         }
     }
 
-    pub fn get<'a, 'i>(&'i self, arena: &'a Arena<T>) -> &'i T 
+    pub const fn val(&self) -> usize {
+        self.index_
+    }
+
+    pub fn get<'a, 'i>(&'i self, arena: &'a Arena<T>) -> &'i T
     where
         'a: 'i,
     {
@@ -52,6 +56,11 @@ impl<T> Idx<T> {
         'a: 'i,
     {
         &mut arena.slab_[self.index_]
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn new_for_test_(id: usize) -> Self {
+        Self::new(id)
     }
 }
 
