@@ -13,20 +13,20 @@ use crate::{
     node_::{TreeNode, TreeNodeId},
 };
 
-pub struct BPlusTree<T, C, const M: usize>
+pub struct BPlusTree<const M: usize, C, K, V = ()>
 where
-    C: TrComparer<T>,
+    C: TrComparer<K>,
 {
     len_: usize,
     comparer_: C,
-    tree_root_: Option<TreeNodeId<T, M>>,
-    data_arena_: Arena<T>,
-    node_arena_: Arena<TreeNode<T, M>>,
+    tree_root_: Option<TreeNodeId<M, K, V>>,
+    data_arena_: Arena<(K, V)>,
+    node_arena_: Arena<TreeNode<M, K, V>>,
 }
 
-impl<T, C, const M: usize> BPlusTree<T, C, M>
+impl<const M: usize, C, K, V> BPlusTree<M, C, K, V>
 where
-    C: TrComparer<T>,
+    C: TrComparer<K>,
 {
     pub const fn degree(&self) -> usize { M }
 
@@ -59,27 +59,27 @@ where
         &self.comparer_
     }
 
-    pub fn first(&self) -> Option<&T> {
+    pub fn first(&self) -> Option<(&K, &V)> {
         todo!()
     }
 
     /// Returns the maximum key-value pair.
-    pub fn last(&self) -> Option<&T> {
+    pub fn last(&self) -> Option<&(&K, &V)> {
         todo!()
     }
 
     /// Returns a reference to the value corresponding to `key`.
-    pub fn get<Q>(&self, key: Q) -> Option<&T>
+    pub fn get<Q>(&self, query: Q) -> Option<(&K, &V)>
     where
-        Q: Borrow<T>,
+        Q: Borrow<K>,
     {
         todo!()
     }
 
     /// Returns a mutable reference to the value corresponding to `key`.
-    pub fn get_mut<Q>(&mut self, key: Q) -> Option<&mut T>
+    pub fn get_mut<Q>(&mut self, query: Q) -> Option<(&K, &mut V)>
     where
-        Q: Borrow<T>,
+        Q: Borrow<K>,
     {
         todo!()
     }
@@ -88,9 +88,9 @@ where
         &'f self,
         hint: &TyHint,
         cmp: &TyCmp,
-    ) -> Option<&'f T>
+    ) -> Option<(&'f K, &'f V)>
     where
-        TyCmp: TrComparer<T, TyHint>,
+        TyCmp: TrComparer<K, TyHint>,
     {
         todo!()
     }
@@ -99,9 +99,9 @@ where
         &'f mut self,
         hint: &TyHint,
         cmp: &TyCmp,
-    ) -> Option<&'f mut T>
+    ) -> Option<(&'f K, &'f mut V)>
     where
-        TyCmp: TrComparer<T, TyHint>,
+        TyCmp: TrComparer<K, TyHint>,
     {
         todo!()
     }
@@ -110,17 +110,20 @@ where
         &'f mut self,
         hint: &TyHint,
         cmp: &TyCmp,
-        factory: impl FnOnce(&TyHint) -> Option<T>,
-    ) -> Result<&'f T, Conflict<'f, T>>
+        factory: impl FnOnce(&TyHint) -> Option<(K, V)>,
+    ) -> Result<(&'f K, &'f mut V) , ConflictInfo<'f, K, V>>
     where
-        TyCmp: TrComparer<T, TyHint>,
+        TyCmp: TrComparer<K, TyHint>,
     {
         todo!()
     }
 }
 
-/// Conflict report when trying to insert into a BPlusTree
-pub struct Conflict<'a, T> {
-    item: &'a mut T,
-    data: T,
+
+#[derive(Debug)]
+pub struct ConflictInfo<'a, K, V = ()> {
+    /// The mut ref to the existing item in the array
+    existing: (&'a K, &'a mut V),
+    /// The conflicting value that failed to insert.
+    conflict: Option<(K, V)>
 }

@@ -25,3 +25,18 @@ pub use tree_::BPlusTree;
 pub mod x_deps {
     pub use slab;
 }
+
+pub trait IntoPair {
+    type PairType;
+
+    fn into_pair(self) -> (Self, ())
+    where
+        Self: Sized,
+    {
+        (self, ())
+    }
+}
+
+impl<T: Sized> IntoPair for T {
+    type PairType = (T, ());
+}
