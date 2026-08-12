@@ -87,6 +87,8 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
         }
     }
 
+    pub const fn capacity(&self) -> usize { N }
+
     /// 返回是否为空。
     pub const fn is_empty(&self) -> bool {
         self.count_ == 0
@@ -95,11 +97,6 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
     /// 返回当前元素个数。
     pub const fn len(&self) -> usize {
         self.count_
-    }
-
-    /// 返回最大容量。
-    pub const fn capacity(&self) -> usize {
-        N
     }
 
     pub const fn get_ref_at(&self, i: usize) -> Result<(&K, &V), usize> {
@@ -167,14 +164,17 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
             let curr_count = self.count_;
             let (hint, _) = &item;
             let pos = self.lower_bound_by(hint, cmp);
-            let lb_phyx_idx = self.order_[pos];
-            let (k, v) = self.get_elem_mut_at_(lb_phyx_idx);
-            if pos < curr_count && cmp.compare(k, hint) == Ordering::Equal {
-                return TryInsertResult::Conflict(ConflictInfo {
-                    at: pos,
-                    existing: (k as &_, v),
-                    conflict: ConflictItem::Pair(item),
-                });
+            if pos < curr_count {
+                let lb_phyx_idx = self.order_[pos];
+                let (k, v) = unsafe { self.elems_[lb_phyx_idx].assume_init_mut() };
+
+                if cmp.compare(k, hint) == Ordering::Equal {
+                    return TryInsertResult::Conflict(ConflictInfo {
+                        at: pos,
+                        existing: (k as &_, v),
+                        conflict: ConflictItem::Pair(item),
+                    });
+                }
             }
             // 2. 移动 order 元素以腾出位置（从后往前移动）
             //    新索引 = len（旧长度），插入后总长度变为 len+1
@@ -207,7 +207,7 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
     /// `Conflict` 的具体处理方式由调用者决定，例如拒绝插入、
     /// 修改已有元素或使用新元素替换已有元素的部分字段。
     pub fn try_insert_by<'f, TyCmp>(
-        &'f mut self, 
+        &'f mut self,
         hint: &'f K,
         cmp: &TyCmp,
         factory: impl FnOnce(&K) -> (K, V),
@@ -231,14 +231,18 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
             // 1. 在现有逻辑顺序（order[0..len]）中查找插入位置
             let curr_count = self.count_;
             let pos = self.lower_bound_by(hint, cmp);
-            let lb_phyx_idx = self.order_[pos];
-            let (k, v) = self.get_elem_mut_at_(lb_phyx_idx);
-            if pos < curr_count && cmp.compare(k, hint) == Ordering::Equal {
-                return TryInsertResult::Conflict(ConflictInfo {
-                    at: pos,
-                    existing: (k as &_, v),
-                    conflict: ConflictItem::Key(hint),
-                });
+
+            if pos < curr_count {
+                let lb_phyx_idx = self.order_[pos];
+                let (k, v) = unsafe { self.elems_[lb_phyx_idx].assume_init_mut() };
+
+                if cmp.compare(k, hint) == Ordering::Equal {
+                    return TryInsertResult::Conflict(ConflictInfo {
+                        at: pos,
+                        existing: (k as &_, v),
+                        conflict: ConflictItem::Key(hint),
+                    });
+                }
             }
             // 2. 移动 order 元素以腾出位置（从后往前移动）
             //    新索引 = len（旧长度），插入后总长度变为 len+1
@@ -299,9 +303,12 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
         TyCmp: TrComparer<K, TyHint>,
     {
         let pos = self.lower_bound_by(hint, cmp);
-        let lb_phyx_idx = self.order_[pos];
-        let (k, _) = self.get_elem_at_(lb_phyx_idx);
-        if pos < self.count_ && cmp.compare(k, hint) == Ordering::Equal {
+        if pos == self.count_ {
+            return Err(pos);
+        }
+        let phyx_idx = self.order_[pos];
+        let (k, _) = unsafe { self.elems_[phyx_idx].assume_init_ref() };
+        if cmp.compare(k, hint) == Ordering::Equal {
             Ok(pos)
         } else {
             Err(pos)
@@ -345,7 +352,8 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
 
         while left < right {
             let mid = left + (right - left) / 2;
-            let (k, _) = self.get_elem_at_(self.order_[mid]);
+            let mid_phyx = self.order_[mid];
+            let (k, _) = unsafe { self.elems_[mid_phyx].assume_init_ref() };
 
             if pred(k, query) {
                 left = mid + 1;
@@ -356,44 +364,15 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
         left
     }
 
-    // /// 在现有逻辑顺序中查找新物理索引应插入的位置（二分查找）。
-    // fn binary_search_<K, VyHint, TyCmp>(
-    //     &self,
-    //     hint: &TyHint,
-    //     cmp: &TyCmp,
-    // ) -> Result<usize, usize>
-    // where
-    //     TyCmp: TrComparer<K, V, TyHint>,
-    // {
-    //     let mut left = 0;
-    //     let mut right = self.count_; // 当前有效逻辑长度
-    //     while left < right {
-    //         let mid = (left + right) / 2;
-    //         let mid_phys = self.order_[mid];
-    //         let mid_val = self.get_elem_at_(mid_phys);
-    //         let ordering = cmp.compare(mid_val, hint);
-    //         match ordering {
-    //             Ordering::Less => left = mid + 1,
-    //             Ordering::Greater => right = mid,
-    //             Ordering::Equal => return Result::Err(mid),
-    //         }
-    //     }
-    //     Result::Ok(left)
-    // }
 
+
+    /// 在 orders 下表为 i 处插入 p，其他值往后移。
+    /// 使用前必须先保证 self.count_ < N
     fn move_insert_position_(&mut self, i: usize, p: usize) {
         for i in (i..self.count_).rev() {
             self.order_[i + 1] = self.order_[i];
         }
         self.order_[i] = p;
-    }
-
-    fn get_elem_at_(&self, phyx_id: usize) -> &(K, V) {
-        unsafe { self.elems_[phyx_id].assume_init_ref() }
-    }
-
-    fn get_elem_mut_at_(&mut self, phyx_id: usize) -> &mut (K, V) {
-        unsafe { self.elems_[phyx_id].assume_init_mut() }
     }
 }
 
