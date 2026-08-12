@@ -13,13 +13,13 @@ extern crate std;
 
 mod arena_;
 mod comparer_;
-mod tree_;
 mod node_;
 mod ordered_arr_;
 mod search_;
+mod tree_;
 
 pub use comparer_::{OrdComparer, TrComparer};
-pub use ordered_arr_::{OrderedArray, TryInsertResult, Iter};
+pub use ordered_arr_::{Iter, OrderedArray, TryInsertResult};
 pub use tree_::BPlusTree;
 
 pub mod x_deps {

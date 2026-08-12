@@ -1,8 +1,4 @@
-﻿use core::{
-    cmp,
-    marker::PhantomData,
-    mem::ManuallyDrop,
-};
+use core::{cmp, marker::PhantomData, mem::ManuallyDrop};
 
 use slab::Slab;
 
@@ -14,7 +10,9 @@ pub struct Arena<T> {
 
 impl<T> Arena<T> {
     pub const fn new() -> Self {
-        Arena { slab_: ManuallyDrop::new(Slab::new()) }
+        Arena {
+            slab_: ManuallyDrop::new(Slab::new()),
+        }
     }
 
     pub fn insert(&mut self, data: T) -> Idx<T> {
@@ -128,11 +126,7 @@ impl<'a, L, R, C> HeteroIdxComparer<'a, L, R, C>
 where
     C: TrComparer<L, R>,
 {
-    pub const fn new(
-        comparer: &'a C,
-        arena_lhs: &'a Arena<L>,
-        arena_rhs: &'a Arena<R>,
-    ) -> Self {
+    pub const fn new(comparer: &'a C, arena_lhs: &'a Arena<L>, arena_rhs: &'a Arena<R>) -> Self {
         HeteroIdxComparer {
             comparer_: comparer,
             arena_l_: arena_lhs,

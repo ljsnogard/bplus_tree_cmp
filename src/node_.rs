@@ -1,7 +1,9 @@
 use core::{cmp, marker::PhantomData};
 
 use crate::{
-    arena_::{self, Arena, Idx}, comparer_::TrComparer, ordered_arr_::OrderedArray,
+    arena_::{Arena, Idx},
+    comparer_::TrComparer,
+    ordered_arr_::OrderedArray,
 };
 
 /// OrderedArray type used in DataLeaf, the actual storage type is `(Idx<K, V>, ())`.
@@ -42,28 +44,28 @@ pub enum TreeNode<const M: usize, K, V> {
 
 #[derive(Debug)]
 pub struct RootNode<const M: usize, K, V> {
-    pub(crate)children_: IndexIdOrdArr<M, K, V>,
-    pub(crate)sentinel_: Option<LeafSentinel<M, K, V>>,
+    pub(crate) children_: IndexIdOrdArr<M, K, V>,
+    pub(crate) sentinel_: Option<LeafSentinel<M, K, V>>,
 }
 
 ///
 #[derive(Debug)]
 pub struct IndexNode<const M: usize, K, V> {
-    pub(crate)children_: IndexIdOrdArr<M, K, V>,
-    pub(crate)parent_: TreeNodeId<M, K, V>,
+    pub(crate) children_: IndexIdOrdArr<M, K, V>,
+    pub(crate) parent_: TreeNodeId<M, K, V>,
 }
 
 #[derive(Debug)]
 pub struct DataLeaf<const M: usize, K, V> {
-    pub(crate)order_arr_: DataIdOrdArr<M, K, V>,
-    pub(crate)prev_sibl_: TreeNodeId<M, K, V>,
-    pub(crate)next_sibl_: TreeNodeId<M, K, V>,
+    pub(crate) order_arr_: DataIdOrdArr<M, K, V>,
+    pub(crate) prev_sibl_: TreeNodeId<M, K, V>,
+    pub(crate) next_sibl_: TreeNodeId<M, K, V>,
 }
 
 #[derive(Debug)]
 pub struct LeafSentinel<const M: usize, K, V> {
-    pub(crate)head_: TreeNodeId<M, K, V>,
-    pub(crate)tail_: TreeNodeId<M, K, V>,
+    pub(crate) head_: TreeNodeId<M, K, V>,
+    pub(crate) tail_: TreeNodeId<M, K, V>,
 }
 
 fn select_key<'f, K, V>(t: (&'f K, &'f V)) -> &'f K {
@@ -138,11 +140,7 @@ where
         }
     }
 
-    pub fn compare(
-        &self,
-        lhs: &(K, V),
-        rhs: &TreeNode<M, K, V>,
-    ) -> cmp::Ordering {
+    pub fn compare(&self, lhs: &(K, V), rhs: &TreeNode<M, K, V>) -> cmp::Ordering {
         let (l_key, _) = lhs;
         let r_key = <P as TrPickKeyPolicy<M, K, V>>::pick(rhs, self.arena_);
         self.k_cmp_.compare(l_key, r_key)
@@ -169,7 +167,8 @@ where
     }
 }
 
-impl<const M: usize, P, C, K, V> TrComparer<(K, V), TreeNode<M, K, V>> for IndexKeyComparer<'_, M, P, C, K, V>
+impl<const M: usize, P, C, K, V> TrComparer<(K, V), TreeNode<M, K, V>>
+    for IndexKeyComparer<'_, M, P, C, K, V>
 where
     P: TrPickKeyPolicy<M, K, V>,
     C: TrComparer<K>,
@@ -201,11 +200,7 @@ where
         }
     }
 
-    pub fn compare(
-        &self,
-        lhs: &(K, V),
-        rhs: &TreeNode<M, K, V>,
-    ) -> cmp::Ordering {
+    pub fn compare(&self, lhs: &(K, V), rhs: &TreeNode<M, K, V>) -> cmp::Ordering {
         let (l_key, _) = lhs;
         let r_key = <P as TrPickKeyPolicy<M, K, V>>::pick(rhs, self.arena_);
         <K as Ord>::cmp(l_key, r_key)
@@ -230,7 +225,8 @@ where
     }
 }
 
-impl<const M: usize, P, K, V> TrComparer<(K, V), TreeNode<M, K, V>> for IndexOrdKeyComparer<'_, M, P, K, V>
+impl<const M: usize, P, K, V> TrComparer<(K, V), TreeNode<M, K, V>>
+    for IndexOrdKeyComparer<'_, M, P, K, V>
 where
     P: TrPickKeyPolicy<M, K, V>,
     K: Ord,

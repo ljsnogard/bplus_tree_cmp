@@ -1,7 +1,4 @@
-use core::{
-    cmp::Ordering,
-    marker::PhantomData,
-};
+use core::{cmp::Ordering, marker::PhantomData};
 
 /// Comparer used by [`BPlusTree`].
 ///
@@ -66,7 +63,10 @@ where
     C: TrComparer<T>,
 {
     pub const fn new(cmp: &'a C) -> Self {
-        PairAdaptComparer { t_cmp_: cmp, _t_: PhantomData }
+        PairAdaptComparer {
+            t_cmp_: cmp,
+            _t_: PhantomData,
+        }
     }
 }
 

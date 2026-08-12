@@ -1,8 +1,6 @@
-﻿use crate::{
+use crate::{
     arena_::{Arena, Idx},
-    node_::{
-        DataLeaf, IndexNode, IndexIdOrdArr, RootNode, TreeNode, TreeNodeId,
-    }
+    node_::{DataLeaf, IndexNode, RootNode, TreeNode, TreeNodeId},
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -26,28 +24,9 @@ where
 {
     let node = node_idx.get(arena);
     match node {
-        TreeNode::Index(index) =>
-            partition_point_from_index_(
-                index,
-                arena,
-                hint,
-                pred,
-            ),
-        TreeNode::Leaf(leaf) =>
-            partition_point_from_leaf(
-                leaf,
-                arena,
-                hint,
-                pred,
-            ),
-        TreeNode::Root(root) =>
-            partition_point_from_root(
-                root,
-                node_idx,
-                arena,
-                hint,
-                pred,
-            ),
+        TreeNode::Index(index) => partition_point_from_index_(index, arena, hint, pred),
+        TreeNode::Leaf(leaf) => partition_point_from_leaf(leaf, arena, hint, pred),
+        TreeNode::Root(root) => partition_point_from_root(root, node_idx, arena, hint, pred),
     }
 }
 
@@ -90,15 +69,15 @@ where
     todo!()
 }
 
-
 #[cfg(test)]
 mod tests_search_tree_ {
     use super::*;
     use crate::{
         arena_::{Arena, HeteroIdxComparer, HomoIdxComparer},
-        comparer_::{OrdComparer, TrComparer},
+        comparer_::TrComparer,
         node_::{
-            DataIdOrdArr, DataLeaf, IndexNode, IndexOrdKeyComparer, LeafSentinel, RootNode, TreeNode,
+            DataIdOrdArr, IndexIdOrdArr, DataLeaf, IndexNode, IndexOrdKeyComparer, LeafSentinel, RootNode,
+            TreeNode,
         },
         ordered_arr_::OrderedArray,
     };
@@ -180,19 +159,14 @@ mod tests_search_tree_ {
             let dummy = {
                 // 只用于初始化字段，之后不会被真正使用。
                 // 此处需要一个合法 NodeId，因此先插入一个临时节点。
-                node_arena.insert(TreeNode::Leaf(
-                    DataLeaf {
-                        order_arr_: OrderedArray::new(),
-                        prev_sibl_: Idx::new_for_test_(0),
-                        next_sibl_: Idx::new_for_test_(0),
-                    }
-                ))
+                node_arena.insert(TreeNode::Leaf(DataLeaf {
+                    order_arr_: OrderedArray::new(),
+                    prev_sibl_: Idx::new_for_test_(0),
+                    next_sibl_: Idx::new_for_test_(0),
+                }))
             };
 
-            let mut leaves = [
-                dummy, dummy, dummy,
-                dummy, dummy, dummy,
-            ];
+            let mut leaves = [dummy, dummy, dummy, dummy, dummy, dummy];
 
             let kv_cmp = KvPairComparer;
             let idx_cmp = DataIdComparer::new(&kv_cmp, &data_arena);
@@ -202,33 +176,19 @@ mod tests_search_tree_ {
 
                 let begin = i * 2;
 
-                assert!(
-                    leaf_arr
-                        .try_insert_item(
-                            data[begin],
-                            &idx_cmp,
-                        )
-                        .is_succ()
-                );
+                assert!(leaf_arr.try_insert_item(data[begin], &idx_cmp,).is_succ());
 
                 assert!(
                     leaf_arr
-                        .try_insert_item(
-                            data[begin + 1],
-                            &idx_cmp,
-                        )
+                        .try_insert_item(data[begin + 1], &idx_cmp,)
                         .is_succ()
                 );
 
-                leaves[i] = node_arena.insert(
-                    TreeNode::Leaf(
-                        DataLeaf {
-                            order_arr_: leaf_arr,
-                            prev_sibl_: dummy,
-                            next_sibl_: dummy,
-                        }
-                    )
-                );
+                leaves[i] = node_arena.insert(TreeNode::Leaf(DataLeaf {
+                    order_arr_: leaf_arr,
+                    prev_sibl_: dummy,
+                    next_sibl_: dummy,
+                }));
             }
 
             /*
@@ -247,21 +207,11 @@ mod tests_search_tree_ {
              */
 
             for i in 0..6 {
-                let prev = if i == 0 {
-                    leaves[i]
-                } else {
-                    leaves[i - 1]
-                };
+                let prev = if i == 0 { leaves[i] } else { leaves[i - 1] };
 
-                let next = if i == 5 {
-                    leaves[i]
-                } else {
-                    leaves[i + 1]
-                };
+                let next = if i == 5 { leaves[i] } else { leaves[i + 1] };
 
-                let TreeNode::Leaf(leaf) =
-                    leaves[i].get_mut(&mut node_arena)
-                else {
+                let TreeNode::Leaf(leaf) = leaves[i].get_mut(&mut node_arena) else {
                     unreachable!()
                 };
 
@@ -304,26 +254,18 @@ mod tests_search_tree_ {
                 (4usize, 100, 4usize, 120, 5usize),
             ];
 
-            for (i, &(data0, _, leaf0, data1, leaf1))
-                in index_ranges.iter().enumerate()
-            {
+            for (i, &(data0, _, leaf0, data1, leaf1)) in index_ranges.iter().enumerate() {
                 let mut children = IndexIdOrdArr::new();
 
                 assert!(
                     children
-                        .try_insert_pair_by(
-                            (data[data0], leaves[leaf0]),
-                            &idx_cmp,
-                        )
+                        .try_insert_pair_by((data[data0], leaves[leaf0]), &idx_cmp,)
                         .is_succ()
                 );
 
                 assert!(
                     children
-                        .try_insert_pair_by(
-                            (data[data0 + 1], leaves[leaf0]),
-                            &idx_cmp,
-                        )
+                        .try_insert_pair_by((data[data0 + 1], leaves[leaf0]), &idx_cmp,)
                         .is_succ()
                 );
 
@@ -343,10 +285,7 @@ mod tests_search_tree_ {
 
                 assert!(
                     children
-                        .try_insert_pair_by(
-                            (data[data0 + 1], leaves[leaf0]),
-                            &idx_cmp,
-                        )
+                        .try_insert_pair_by((data[data0 + 1], leaves[leaf0]), &idx_cmp,)
                         .is_succ()
                 );
 
@@ -364,14 +303,10 @@ mod tests_search_tree_ {
                  * 当前先使用 dummy。
                  */
 
-                indexes[i] = node_arena.insert(
-                    TreeNode::Index(
-                        IndexNode {
-                            children_: children,
-                            parent_: dummy,
-                        }
-                    )
-                );
+                indexes[i] = node_arena.insert(TreeNode::Index(IndexNode {
+                    children_: children,
+                    parent_: dummy,
+                }));
             }
 
             /*
@@ -402,19 +337,13 @@ mod tests_search_tree_ {
             //     );
             // }
 
-            let root = node_arena.insert(
-                TreeNode::Root(
-                    RootNode {
-                        children_: root_children,
-                        sentinel_: Some(
-                            LeafSentinel {
-                                head_: leaves[0],
-                                tail_: leaves[5],
-                            }
-                        ),
-                    }
-                )
-            );
+            let root = node_arena.insert(TreeNode::Root(RootNode {
+                children_: root_children,
+                sentinel_: Some(LeafSentinel {
+                    head_: leaves[0],
+                    tail_: leaves[5],
+                }),
+            }));
 
             /*
              * ---------------------------------------------------------

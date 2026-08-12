@@ -1,9 +1,4 @@
-use core::{
-    cmp::Ordering,
-    marker::PhantomData,
-    mem::MaybeUninit,
-    ptr,
-};
+use core::{cmp::Ordering, mem::MaybeUninit, ptr};
 
 use crate::comparer_::{OrdComparer, TrComparer};
 
@@ -27,7 +22,7 @@ pub struct ConflictInfo<'a, K, V = ()> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConflictItem<'a, K, V = ()> {
     Key(&'a K),
-    Pair((K, V))
+    Pair((K, V)),
 }
 
 pub enum TryInsertResult<'a, K, V = ()> {
@@ -99,7 +94,9 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
         }
     }
 
-    pub const fn capacity(&self) -> usize { N }
+    pub const fn capacity(&self) -> usize {
+        N
+    }
 
     /// 返回是否为空。
     pub const fn is_empty(&self) -> bool {
@@ -174,7 +171,7 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
         TyCmp: TrComparer<K>,
     {
         if self.count_ >= N {
-            return TryInsertResult::Full(ConflictItem::Pair(pair))
+            return TryInsertResult::Full(ConflictItem::Pair(pair));
         }
         // 0. 获得物理写入位置的索引
         let new_phys_idx = self.order_[self.count_];
@@ -210,9 +207,7 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
             // 4. 更新长度
             self.count_ += 1;
         }
-        let (k, v) = unsafe {
-            self.elems_[new_phys_idx].assume_init_mut()
-        };
+        let (k, v) = unsafe { self.elems_[new_phys_idx].assume_init_mut() };
         TryInsertResult::Succ((k as &_, v))
     }
 
@@ -241,7 +236,7 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
         TyCmp: TrComparer<K>,
     {
         if self.count_ >= N {
-            return TryInsertResult::Full(ConflictItem::Key(hint))
+            return TryInsertResult::Full(ConflictItem::Key(hint));
         }
         // 0. 获得物理写入位置的索引
         let new_phys_idx = self.order_[self.count_];
@@ -278,9 +273,7 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
             // 4. 更新长度
             self.count_ += 1;
         }
-        let (k, v) = unsafe {
-            self.elems_[new_phys_idx].assume_init_mut()
-        };
+        let (k, v) = unsafe { self.elems_[new_phys_idx].assume_init_mut() };
         TryInsertResult::Succ((k as &_, v))
     }
 
@@ -289,7 +282,7 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
     /// 因为移除后会在最后一个索引位置记录被移除元素的物理索引。
     pub fn try_remove_last(&mut self) -> Option<(K, V)> {
         if self.count_ == 0 {
-            return Option::None
+            return Option::None;
         }
         let last_phyx_ids = self.order_[self.count_ - 1];
         let x = &mut self.elems_[last_phyx_ids];
@@ -355,20 +348,13 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
     where
         C: TrComparer<K, Q>,
     {
-        self.partition_point_(query,|elem, hint| {
-            matches!(
-                cmp.compare(elem, hint),
-                Ordering::Less | Ordering::Equal
-            )
+        self.partition_point_(query, |elem, hint| {
+            matches!(cmp.compare(elem, hint), Ordering::Less | Ordering::Equal)
         })
     }
 
     /// 返回 [0, count_) 中第一个使 pred 返回 false 的位置。
-    fn partition_point_<Q, P>(
-        &self,
-        query: &Q,
-        mut pred: P,
-    ) -> usize
+    fn partition_point_<Q, P>(&self, query: &Q, mut pred: P) -> usize
     where
         P: FnMut(&K, &Q) -> bool,
     {
@@ -388,8 +374,6 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
         }
         left
     }
-
-
 
     /// 在 orders 下表为 i 处插入 p，其他值往后移。
     /// 使用前必须先保证 self.count_ < N
@@ -423,10 +407,7 @@ where
 {
     /// A convenient method that ASSUMING the array using the OrdComparer or
     /// one of its compatible comparers, and then call `try_insert_pair_by`.
-    pub fn try_insert_ord<'f>(
-        &'f mut self,
-        ord: T,
-    ) -> TryInsertResult<'f, T, ()> {
+    pub fn try_insert_ord<'f>(&'f mut self, ord: T) -> TryInsertResult<'f, T, ()> {
         let cmp = OrdComparer::new();
         let pair = (ord, ());
         self.try_insert_pair_by(pair, &cmp)
@@ -510,9 +491,9 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
+        string::{String, ToString},
         vec,
         vec::Vec,
-        string::{String, ToString},
     };
 
     use super::*;
@@ -528,7 +509,7 @@ mod tests {
 
         let conflict = arr.try_insert_ord(1);
         assert!(conflict.is_conflict());
-        let TryInsertResult::Conflict(x)= conflict else {
+        let TryInsertResult::Conflict(x) = conflict else {
             unreachable!()
         };
         assert_eq!(x.at, 0usize);
@@ -585,22 +566,14 @@ mod tests {
         assert_eq!(removed, Some((8, ())));
         assert_eq!(arr.len(), 3);
 
-        let collected: Vec<i32> = arr
-            .iter()
-            .map(select_key)
-            .copied()
-            .collect();
+        let collected: Vec<i32> = arr.iter().map(select_key).copied().collect();
         assert_eq!(collected, vec![1, 2, 5]);
 
         // 再次删除
         let removed2 = arr.try_remove_last();
         assert_eq!(removed2, Some((5, ())));
         assert_eq!(arr.len(), 2);
-        let collected2: Vec<i32> = arr
-            .iter()
-            .map(select_key)
-            .copied()
-            .collect();
+        let collected2: Vec<i32> = arr.iter().map(select_key).copied().collect();
         assert_eq!(collected2, vec![1, 2]);
     }
 
@@ -623,22 +596,14 @@ mod tests {
 
         // 插入 2 → 期望 [1, 2, 3, 4]
         arr.try_insert_ord(2);
-        let collected: Vec<i32> = arr
-            .iter()
-            .map(select_key)
-            .copied()
-            .collect();
+        let collected: Vec<i32> = arr.iter().map(select_key).copied().collect();
         assert_eq!(collected, vec![1, 2, 3, 4]);
 
         // 删除最大值 4
         assert_eq!(arr.try_remove_last(), Some((4, ())));
         // 插入 6 → 期望 [1, 2, 3, 6]
         arr.try_insert_ord(6);
-        let collected: Vec<i32> = arr
-            .iter()
-            .map(select_key)
-            .copied()
-            .collect();
+        let collected: Vec<i32> = arr.iter().map(select_key).copied().collect();
         assert_eq!(collected, vec![1, 2, 3, 6]);
 
         // 确保之前删除的 5 和 4 的位置被正确覆盖，没有残留数据
@@ -686,11 +651,7 @@ mod tests_drop_ {
 
         // 所有弱引用应该已失效（因为 Arc 已被释放）
         for (i, w) in weaks.iter().enumerate() {
-            assert!(
-                w.upgrade().is_none(),
-                "Weak at index {} should be dead",
-                i
-            );
+            assert!(w.upgrade().is_none(), "Weak at index {} should be dead", i);
         }
     }
 }
@@ -845,11 +806,7 @@ mod tests_heter_search_ {
     struct TupleKeyComparer;
 
     impl TrComparer<(u64, &'static str), u64> for TupleKeyComparer {
-        fn compare(
-            &self,
-            value: &(u64, &'static str),
-            query: &u64,
-        ) -> Ordering {
+        fn compare(&self, value: &(u64, &'static str), query: &u64) -> Ordering {
             value.0.cmp(query)
         }
     }
@@ -880,24 +837,12 @@ mod tests_heter_search_ {
         assert_eq!(arr.upper_bound_by(&20u64, &cmp), 2);
         assert_eq!(arr.upper_bound_by(&40u64, &cmp), 4);
 
-        assert_eq!(
-            arr.binary_search_by(&20u64, &cmp),
-            Ok(1)
-        );
+        assert_eq!(arr.binary_search_by(&20u64, &cmp), Ok(1));
 
-        assert_eq!(
-            arr.binary_search_by(&25u64, &cmp),
-            Err(2)
-        );
+        assert_eq!(arr.binary_search_by(&25u64, &cmp), Err(2));
 
-        assert_eq!(
-            arr.find_by(&30u64, &cmp),
-            Some((&(30, "thirty"), &()))
-        );
+        assert_eq!(arr.find_by(&30u64, &cmp), Some((&(30, "thirty"), &())));
 
-        assert_eq!(
-            arr.find_by(&35u64, &cmp),
-            None
-        );
+        assert_eq!(arr.find_by(&35u64, &cmp), None);
     }
 }

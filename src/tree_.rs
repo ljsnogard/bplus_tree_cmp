@@ -2,7 +2,7 @@ use core::{
     borrow::{Borrow, BorrowMut},
     cmp::Ordering,
     marker::PhantomData,
-    mem::{ManuallyDrop},
+    mem::ManuallyDrop,
     ops::Deref,
     ptr,
 };
@@ -28,7 +28,9 @@ impl<const M: usize, C, K, V> BPlusTree<M, C, K, V>
 where
     C: TrComparer<K>,
 {
-    pub const fn degree(&self) -> usize { M }
+    pub const fn degree(&self) -> usize {
+        M
+    }
 
     /// Creates an empty B-tree using `order` as its key comparator.
     pub const fn new_in(comparer: C) -> Self {
@@ -84,11 +86,7 @@ where
         todo!()
     }
 
-    pub fn get_by<'f, TyHint, TyCmp>(
-        &'f self,
-        hint: &TyHint,
-        cmp: &TyCmp,
-    ) -> Option<(&'f K, &'f V)>
+    pub fn get_by<'f, TyHint, TyCmp>(&'f self, hint: &TyHint, cmp: &TyCmp) -> Option<(&'f K, &'f V)>
     where
         TyCmp: TrComparer<K, TyHint>,
     {
@@ -111,7 +109,7 @@ where
         hint: &TyHint,
         cmp: &TyCmp,
         factory: impl FnOnce(&TyHint) -> Option<(K, V)>,
-    ) -> Result<(&'f K, &'f mut V) , ConflictInfo<'f, K, V>>
+    ) -> Result<(&'f K, &'f mut V), ConflictInfo<'f, K, V>>
     where
         TyCmp: TrComparer<K, TyHint>,
     {
@@ -119,11 +117,10 @@ where
     }
 }
 
-
 #[derive(Debug)]
 pub struct ConflictInfo<'a, K, V = ()> {
     /// The mut ref to the existing item in the array
     existing: (&'a K, &'a mut V),
     /// The conflicting value that failed to insert.
-    conflict: Option<(K, V)>
+    conflict: Option<(K, V)>,
 }
