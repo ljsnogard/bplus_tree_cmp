@@ -120,14 +120,12 @@ mod tests_search_tree_ {
             let mut data_arena = Arena::<(KeyI32, ValStr)>::new();
             let mut node_arena = Arena::<Tree>::new();
 
-            /*
-             * ---------------------------------------------------------
-             * 1. 建立 Data Arena
-             *
-             * 数据只存在这里一次。
-             * IndexNode 和 DataLeaf 都只保存 Idx<(K,V)>。
-             * ---------------------------------------------------------
-             */
+            // ---------------------------------------------------------
+            // 1. 建立 Data Arena
+            //
+            // 数据只存在这里一次。
+            // IndexNode 和 DataLeaf 都只保存 Idx<(K,V)>。
+            // ---------------------------------------------------------
 
             let data = [
                 data_arena.insert((10, "ten")),
@@ -144,17 +142,13 @@ mod tests_search_tree_ {
                 data_arena.insert((120, "one hundred twenty")),
             ];
 
-            /*
-             * ---------------------------------------------------------
-             * 2. 先建立六个 Leaf
-             *
-             * 这里暂时使用 dummy id 填 prev/next。
-             * 因为 TreeNodeId 是 Copy 的，所以之后可以重新建立
-             * DataLeaf 来完成 sibling link。
-             *
-             * 更简单的做法是先插入叶子，再用 get_mut 修改 link。
-             * ---------------------------------------------------------
-             */
+            // ---------------------------------------------------------
+            // 2. 先建立六个 Leaf
+            //
+            // 这里暂时使用 dummy id 填 prev/next。
+            // 因为 TreeNodeId 是 Copy 的，所以之后可以重新建立
+            // DataLeaf 来完成 sibling link。
+            // ---------------------------------------------------------
 
             let dummy = {
                 // 只用于初始化字段，之后不会被真正使用。
@@ -191,24 +185,14 @@ mod tests_search_tree_ {
                 }));
             }
 
-            /*
-             * dummy 不再需要作为树的一部分。
-             *
-             * 注意：当前 Arena 没有 remove，因此它仍然存在于 Arena
-             * 中，但不会被 Root / Index / Leaf 引用。
-             *
-             * 对 search 测试而言这没有任何影响。
-             */
+            // dummy 不再需要作为树的一部分。Arena 目前不支持移除，这里保留但不会被引用。
 
-            /*
-             * ---------------------------------------------------------
-             * 3. 修复 Leaf sibling links
-             * ---------------------------------------------------------
-             */
+            // ---------------------------------------------------------
+            // 3. 修复 Leaf sibling links
+            // ---------------------------------------------------------
 
             for i in 0..6 {
                 let prev = if i == 0 { leaves[i] } else { leaves[i - 1] };
-
                 let next = if i == 5 { leaves[i] } else { leaves[i + 1] };
 
                 let TreeNode::Leaf(leaf) = leaves[i].get_mut(&mut node_arena) else {
@@ -222,29 +206,16 @@ mod tests_search_tree_ {
             let index_ord_cmp = IndexOrdKeyComparer::pick_first_key(&data_arena);
             let hetero_cmp = HeteroIdxComparer::new(&index_ord_cmp, &data_arena, &node_arena);
 
-            /*
-             * ---------------------------------------------------------
-             * 4. 建立三个 IndexNode
-             *
-             * 每个 entry：
-             *
-             *     separator key -> child
-             *
-             * separator 是 child subtree 的最大 key。
-             *
-             * I0:
-             *     20 -> L0
-             *     40 -> L1
-             *
-             * I1:
-             *     60 -> L2
-             *     80 -> L3
-             *
-             * I2:
-             *     100 -> L4
-             *     120 -> L5
-             * ---------------------------------------------------------
-             */
+            // ---------------------------------------------------------
+            // 4. 建立三个 IndexNode
+            //
+            // 每个 entry：
+            //     separator key -> child
+            // separator 是 child subtree 的最大 key。
+            // I0: 20 -> L0, 40 -> L1
+            // I1: 60 -> L2, 80 -> L3
+            // I2: 100 -> L4, 120 -> L5
+            // ---------------------------------------------------------
 
             let mut indexes = [dummy, dummy, dummy];
 
@@ -368,6 +339,99 @@ mod tests_search_tree_ {
                 data,
                 leaves,
                 indexes,
+            }
+        }
+    }
+
+    #[test]
+    fn fixture_leaf_chain_is_correct() {
+        let fx = SearchFixture::new();
+
+        // 验证每个叶子节点的 prev/next 指针
+        for i in 0..6 {
+            let node = fx.leaves[i].get(&fx.node_arena);
+            if let TreeNode::Leaf(leaf) = node {
+                let prev_expected = if i == 0 { fx.leaves[i] } else { fx.leaves[i - 1] };
+                let next_expected = if i == 5 { fx.leaves[i] } else { fx.leaves[i + 1] };
+                assert_eq!(leaf.prev_sibl_, prev_expected);
+                assert_eq!(leaf.next_sibl_, next_expected);
+
+                // 验证叶子内的 key 顺序
+                let mut prev_key = None;
+                for data_id in leaf.order_arr_.iter() {
+                    let (k, _v) = data_id.get(&fx.data_arena);
+                    if let Some(pk) = prev_key {
+                        assert!(pk < k, "keys should be strictly increasing in leaf");
+                    }
+                    prev_key = Some(*k);
+                }
+            } else {
+                panic!("expected leaf node");
+            }
+        }
+    }
+
+    #[test]
+    fn fixture_root_and_indexes_correct() {
+        let fx = SearchFixture::new();
+
+        // 验证 root sentinel
+        let root_node = fx.root.get(&fx.node_arena);
+        if let TreeNode::Root(r) = root_node {
+            let sentinel = r.sentinel_.as_ref().expect("root sentinel set");
+            assert_eq!(sentinel.head_, fx.leaves[0]);
+            assert_eq!(sentinel.tail_, fx.leaves[5]);
+
+            // root children 对应于 indexes
+            let mut idxs = Vec::new();
+            for (idx, _) in r.children_.iter() {
+                idxs.push(*idx);
+            }
+            assert_eq!(idxs.len(), fx.indexes.len());
+            for &i in &fx.indexes {
+                assert!(idxs.contains(&i));
+            }
+        } else {
+            panic!("expected root node");
+        }
+
+        // 验证每个 index 的 parent 已指向 root，并且 children_ 非空
+        for &index in &fx.indexes {
+            let node = index.get(&fx.node_arena);
+            if let TreeNode::Index(inode) = node {
+                assert_eq!(inode.parent_, fx.root);
+                assert!(!inode.children_.is_empty());
+            } else {
+                panic!("expected index node");
+            }
+        }
+    }
+
+    // TODO: 当 search 相关函数实现后，取消 ignore 并完成断言
+    #[test]
+    #[ignore]
+    fn partition_point_recursive_placeholder() {
+        let fx = SearchFixture::new();
+
+        // 示例：寻找第一个 key >= 35
+        use core::cmp::Ordering;
+
+        let hint = ();
+
+        let res = partition_point_recursive_(&fx.root, &fx.node_arena, &hint, |k: &KeyI32, _h: &()| {
+            // pred 返回 true 当 key < 35
+            *k < 35
+        });
+
+        // 期望返回 Data 或 Node 的位置，视实现而定
+        // 这里仅打印以便手动检查。
+        match res {
+            PartitionPointIdx::Data(d) => {
+                let (k, v) = d.get(&fx.data_arena);
+                eprintln!("found data: {} -> {}", k, v);
+            }
+            PartitionPointIdx::Node(n) => {
+                eprintln!("found node id: {:?}", n);
             }
         }
     }
