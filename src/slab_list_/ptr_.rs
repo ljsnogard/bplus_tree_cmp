@@ -79,6 +79,7 @@ impl<T> SlotPtr<T> {
     ///
     /// 该句柄不能解引用；只用于在节点字段尚未填好时占位。
     #[cfg(test)]
+    #[allow(unused)]
     pub(crate) fn dangling_for_test_() -> Self {
         SlotPtr {
             ptr_: NonNull::dangling(),
