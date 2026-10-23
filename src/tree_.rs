@@ -37,7 +37,7 @@ use crate::{
     comparer_::{QuerySlotComparer, SlotPairKeyComparer, TrComparer},
     node_::{DataLeaf, IndexNode, IndexPtrOrdArr, TreeNode, TreeNodePtr},
     ordered_arr_::OrderedArray,
-    search_::{DescentPath, descend_to_leaf_, find_in_leaf_},
+    search_::{DescentPath, descend_to_leaf_, find_in_leaf_, find_leaf_},
     slab_list_::{SlabList, SlabListError, SlotPtr},
 };
 
@@ -1110,7 +1110,7 @@ where
         let query_ref = query.borrow();
         let root = self.tree_root_?;
         let query_cmp = QuerySlotComparer::new_(&self.comparer_);
-        let (leaf_ptr, _) = descend_to_leaf_(root, query_ref, &query_cmp);
+        let leaf_ptr = find_leaf_(root, query_ref, &query_cmp);
 
         // SAFETY: 叶子指针由树维护；查询期间 &mut self 保证没有其他引用。
         let leaf = unsafe { node_ref_(leaf_ptr) }.as_leaf_()?;
@@ -1130,7 +1130,7 @@ where
     {
         let root = self.tree_root_?;
         let query_cmp = QuerySlotComparer::new_(cmp);
-        let (leaf_ptr, _) = descend_to_leaf_(root, query, &query_cmp);
+        let leaf_ptr = find_leaf_(root, query, &query_cmp);
 
         // SAFETY: 叶子指针由树维护；&self 保证期间结构不变。
         let leaf = unsafe { node_ref_(leaf_ptr) }.as_leaf_()?;
@@ -1152,7 +1152,7 @@ where
     {
         let root = self.tree_root_?;
         let query_cmp = QuerySlotComparer::new_(cmp);
-        let (leaf_ptr, _) = descend_to_leaf_(root, query, &query_cmp);
+        let leaf_ptr = find_leaf_(root, query, &query_cmp);
 
         // SAFETY: 叶子指针由树维护；&mut self 保证没有其他引用。
         let leaf = unsafe { node_ref_(leaf_ptr) }.as_leaf_()?;

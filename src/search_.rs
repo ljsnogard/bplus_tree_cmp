@@ -38,7 +38,7 @@ where
     Q: ?Sized,
     C: TrComparer<SlotPtr<(K, V)>, Q>,
 {
-    let mut path = Vec::new();
+    let mut path = DescentPath::with_capacity(8);
     let mut current = root;
 
     loop {
@@ -50,27 +50,70 @@ where
             return (current, path);
         };
 
-        let children = &index.children_;
-        if children.is_empty() {
+        let Option::Some((pos, child)) = child_for_(index, query, cmp) else {
             // 损坏的索引节点；返回当前指针，让上层按“找不到”处理。
             return (current, path);
-        }
-
-        let pos = children.lower_bound_by(query, cmp);
-        let pos = if pos == children.len() {
-            children.len() - 1
-        } else {
-            pos
-        };
-
-        let child = match children.get_ref_at(pos) {
-            Ok((_, child)) => *child,
-            Err(_) => return (current, path),
         };
 
         path.push((current, pos));
         current = child;
     }
+}
+
+/// 从 root 下沉到叶子，但不记录 path。
+///
+/// 只读查询不需要 path，因此可以避免每次查询的 `Vec` 分配。
+pub(crate) fn find_leaf_<const M: usize, K, V, Q, C>(
+    root: TreeNodePtr<M, K, V>,
+    query: &Q,
+    cmp: &C,
+) -> TreeNodePtr<M, K, V>
+where
+    Q: ?Sized,
+    C: TrComparer<SlotPtr<(K, V)>, Q>,
+{
+    let mut current = root;
+
+    loop {
+        // SAFETY: 调用方保证 root 有效，且树结构在本次只读搜索期间保持不变。
+        let node = unsafe { &*current.as_ptr() };
+
+        let TreeNode::Index(index) = node else {
+            return current;
+        };
+
+        let Option::Some((_, child)) = child_for_(index, query, cmp) else {
+            return current;
+        };
+
+        current = child;
+    }
+}
+
+/// 在索引节点中选择孩子，返回 `(孩子下标, 孩子指针)`。
+fn child_for_<const M: usize, K, V, Q, C>(
+    index: &crate::node_::IndexNode<M, K, V>,
+    query: &Q,
+    cmp: &C,
+) -> Option<(usize, TreeNodePtr<M, K, V>)>
+where
+    Q: ?Sized,
+    C: TrComparer<SlotPtr<(K, V)>, Q>,
+{
+    let children = &index.children_;
+    if children.is_empty() {
+        return Option::None;
+    }
+
+    let pos = children.lower_bound_by(query, cmp);
+    let pos = if pos == children.len() {
+        children.len() - 1
+    } else {
+        pos
+    };
+
+    let (_, child) = children.get_ref_at(pos).ok()?;
+    Option::Some((pos, *child))
 }
 
 /// 在叶子中查找与 `query` 比较等价的数据。
