@@ -338,6 +338,52 @@ Comparer 负责：
 
 ---
 
+# 性能对比 Benchmark
+
+`benches/btreemap_compare.rs` 使用相同的随机 key 插入顺序、查询序列和删除顺序，
+对比 `BPlusTree` 与 `std::collections::BTreeMap<u64, u64>`：
+
+```text
+cargo bench --bench btreemap_compare
+BENCH_N=500000 BENCH_SAMPLES=7 cargo bench --bench btreemap_compare
+```
+
+表中数值为多次采样的中位数，单位是 ns/op（每次操作纳秒数），越小越好。以下是一次
+`N = 200000`、`samples = 5` 的本机运行结果，仅用于观察数量级：
+
+| operation   | B+Tree(M=4) | B+Tree(M=16) | BTreeMap |
+| ----------- | ----------: | -----------: | -------: |
+| insert      |     1863.61 |      1600.30 |   434.24 |
+| lookup hit  |     1878.61 |      1790.08 |   474.40 |
+| lookup miss |      155.40 |        88.91 |   127.18 |
+| iterate     |       91.87 |        66.34 |    28.42 |
+| remove      |     2139.10 |      1824.92 |   605.95 |
+
+相对 `BTreeMap` 的倍数：
+
+| operation   | B+Tree(M=4) | B+Tree(M=16) |
+| ----------- | ----------: | -----------: |
+| insert      |       4.29x |        3.69x |
+| lookup hit  |       3.96x |        3.77x |
+| lookup miss |       1.22x |        0.70x |
+| iterate     |       3.23x |        2.33x |
+| remove      |       3.53x |        3.01x |
+
+几个符合设计预期的现象：
+
+* `M = 16` 通常比 `M = 4` 更快：树更浅、节点内二分次数略增，但缓存/指针跳转减少；
+* 命中查询比 `BTreeMap` 慢：索引中的 key 是 `SlotPtr<(K, V)>`，每次比较都要
+  解引用到 Data SlabList，而 `BTreeMap` 把 key 直接放在节点里。这正是“不复制 Key”
+  的性能代价；
+* 未命中查询可以比 `BTreeMap` 更快：B+ Tree 更浅，提前失败；
+* 插入/删除仍包含一次 path `Vec` 分配；只读查询已经改为无 path 分配的下沉路径；
+* 迭代需要沿叶子链并逐个解引用数据句柄，因此比 `BTreeMap` 的节点内迭代慢。
+
+对于 `String`、`Vec<u8>` 或大型结构体这类 Key，避免复制带来的收益可能抵消上述
+开销；具体应以实际 Key 类型的 benchmark 为准。
+
+---
+
 # 当前状态
 
 当前已经完成：

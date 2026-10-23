@@ -13,3 +13,7 @@ path = "src/lib.rs"
 
 [dev-dependencies]
 rand = "0.9"
+
+[[bench]]
+name = "btreemap_compare"
+harness = false
