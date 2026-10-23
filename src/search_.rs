@@ -1,12 +1,12 @@
 use crate::{
-    arena_::{Arena, Idx},
-    node_::{DataLeaf, IndexNode, RootNode, TreeNode, TreeNodeId},
+    node_::{DataLeaf, IndexNode, RootNode, TreeNode, TreeNodePtr},
+    slab_list_::SlotPtr,
 };
 
 #[derive(Clone, Copy, Debug)]
-pub enum PartitionPointIdx<const M: usize, K, V> {
-    Data(Idx<(K, V)>),
-    Node(TreeNodeId<M, K, V>),
+pub enum PartitionPoint<const M: usize, K, V> {
+    Data(SlotPtr<(K, V)>),
+    Node(TreeNodePtr<M, K, V>),
 }
 
 /// 从某一个给定的节点开始进行递归搜索，返回第一个使 pred 返回 false 的位置。
@@ -14,19 +14,18 @@ pub enum PartitionPointIdx<const M: usize, K, V> {
 /// 树刚刚构建，完全没有任何节点没有 Root 的情况下）
 /// Pred 的语义应该
 pub fn partition_point_recursive_<'f, const M: usize, K, V, H, P>(
-    node_idx: &'f TreeNodeId<M, K, V>,
-    arena: &'f Arena<TreeNode<M, K, V>>,
+    node_idx: &'f TreeNodePtr<M, K, V>,
     hint: &'f H,
     pred: P,
-) -> PartitionPointIdx<M, K, V>
+) -> PartitionPoint<M, K, V>
 where
     P: FnMut(&K, &H) -> bool,
 {
-    let node = node_idx.get(arena);
+    let node = &**node_idx;
     match node {
-        TreeNode::Index(index) => partition_point_from_index_(index, arena, hint, pred),
-        TreeNode::Leaf(leaf) => partition_point_from_leaf(leaf, arena, hint, pred),
-        TreeNode::Root(root) => partition_point_from_root(root, node_idx, arena, hint, pred),
+        TreeNode::Index(index) => partition_point_from_index_(index, hint, pred),
+        TreeNode::Leaf(leaf) => partition_point_from_leaf(leaf, hint, pred),
+        TreeNode::Root(root) => partition_point_from_root(root, node_idx, hint, pred),
     }
 }
 
@@ -34,10 +33,9 @@ where
 /// 且该位置应为 DataLeaf （如果非空）或者 node_idx （如果空节点）
 fn partition_point_from_index_<'f, const M: usize, K, V, H, P>(
     index: &'f IndexNode<M, K, V>,
-    arena: &'f Arena<TreeNode<M, K, V>>,
     hint: &'f H,
     mut pred: P,
-) -> PartitionPointIdx<M, K, V>
+) -> PartitionPoint<M, K, V>
 where
     P: FnMut(&K, &H) -> bool,
 {
@@ -46,10 +44,9 @@ where
 
 fn partition_point_from_leaf<'f, const M: usize, K, V, H, P>(
     leaf: &'f DataLeaf<M, K, V>,
-    arena: &'f Arena<TreeNode<M, K, V>>,
     hint: &'f H,
     mut pred: P,
-) -> PartitionPointIdx<M, K, V>
+) -> PartitionPoint<M, K, V>
 where
     P: FnMut(&K, &H) -> bool,
 {
@@ -58,11 +55,10 @@ where
 
 fn partition_point_from_root<'f, const M: usize, K, V, H, P>(
     root: &'f RootNode<M, K, V>,
-    root_idx: &'f TreeNodeId<M, K, V>,
-    arena: &'f Arena<TreeNode<M, K, V>>,
+    root_idx: &'f TreeNodePtr<M, K, V>,
     hint: &'f H,
     mut pred: P,
-) -> PartitionPointIdx<M, K, V>
+) -> PartitionPoint<M, K, V>
 where
     P: FnMut(&K, &H) -> bool,
 {
@@ -71,15 +67,16 @@ where
 
 #[cfg(test)]
 mod tests_search_tree_ {
+    use alloc::alloc::Global;
+
     use super::*;
     use crate::{
-        arena_::{Arena, HeteroIdxComparer, HomoIdxComparer},
-        comparer_::TrComparer,
+        comparer_::{HomoSlotComparer, TrComparer},
         node_::{
-            DataIdOrdArr, IndexIdOrdArr, DataLeaf, IndexNode, IndexOrdKeyComparer, LeafSentinel, RootNode,
-            TreeNode,
+            DataLeaf, DataPtrOrdArr, IndexNode, IndexPtrOrdArr, LeafSentinel, RootNode, TreeNode,
         },
         ordered_arr_::OrderedArray,
+        slab_list_::{SlabList, SlotPtr},
     };
 
     const M: usize = 4;
@@ -87,22 +84,22 @@ mod tests_search_tree_ {
     type KeyI32 = i32;
     type ValStr = &'static str;
     type Tree = TreeNode<M, KeyI32, ValStr>;
-    type NodeId = TreeNodeId<M, KeyI32, ValStr>;
-    type DataId = Idx<(KeyI32, ValStr)>;
+    type NodePtr = TreeNodePtr<M, KeyI32, ValStr>;
+    type DataPtr = SlotPtr<(KeyI32, ValStr)>;
 
     struct SearchFixture {
-        data_arena: Arena<(KeyI32, ValStr)>,
-        node_arena: Arena<Tree>,
-        root: NodeId,
+        data_arena: SlabList<(KeyI32, ValStr)>,
+        node_arena: SlabList<Tree>,
+        root: NodePtr,
 
-        // 保存真实的 data id，方便测试时验证返回的 DataId。
-        data: [DataId; 12],
+        // 保存真实的 data 句柄，方便测试时验证返回的 DataPtr。
+        data: [DataPtr; 12],
 
         // 保存叶节点 ID，方便直接验证 leaf chain。
-        leaves: [NodeId; 6],
+        leaves: [NodePtr; 6],
 
         // 保存 index 节点 ID。
-        indexes: [NodeId; 3],
+        indexes: [NodePtr; 3],
     }
 
     struct KvPairComparer;
@@ -113,19 +110,19 @@ mod tests_search_tree_ {
         }
     }
 
-    type DataIdComparer<'f> = HomoIdxComparer<'f, (KeyI32, ValStr), KvPairComparer>;
+    type DataPtrComparer<'f> = HomoSlotComparer<'f, (KeyI32, ValStr), KvPairComparer>;
 
     impl SearchFixture {
         fn new() -> Self {
-            let mut data_arena = Arena::<(KeyI32, ValStr)>::new();
-            let mut node_arena = Arena::<Tree>::new();
+            let mut data_arena = SlabList::<(KeyI32, ValStr)>::new(Global).expect("配置应当有效");
+            let mut node_arena = SlabList::<Tree>::new(Global).expect("配置应当有效");
 
             /*
              * ---------------------------------------------------------
-             * 1. 建立 Data Arena
+             * 1. 建立 Data SlabList
              *
              * 数据只存在这里一次。
-             * IndexNode 和 DataLeaf 都只保存 Idx<(K,V)>。
+             * IndexNode 和 DataLeaf 都只保存 SlotPtr<(K,V)>。
              * ---------------------------------------------------------
              */
 
@@ -149,38 +146,37 @@ mod tests_search_tree_ {
              * 2. 先建立六个 Leaf
              *
              * 这里暂时使用 dummy id 填 prev/next。
-             * 因为 TreeNodeId 是 Copy 的，所以之后可以重新建立
+             * 因为 TreeNodePtr 是 Copy 的，所以之后可以重新建立
              * DataLeaf 来完成 sibling link。
              *
-             * 更简单的做法是先插入叶子，再用 get_mut 修改 link。
+             * 更简单的做法是先插入叶子，再用 DerefMut 修改 link。
              * ---------------------------------------------------------
              */
 
             let dummy = {
                 // 只用于初始化字段，之后不会被真正使用。
-                // 此处需要一个合法 NodeId，因此先插入一个临时节点。
                 node_arena.insert(TreeNode::Leaf(DataLeaf {
                     order_arr_: OrderedArray::new(),
-                    prev_sibl_: Idx::new_for_test_(0),
-                    next_sibl_: Idx::new_for_test_(0),
+                    prev_sibl_: SlotPtr::dangling_for_test_(),
+                    next_sibl_: SlotPtr::dangling_for_test_(),
                 }))
             };
 
             let mut leaves = [dummy, dummy, dummy, dummy, dummy, dummy];
 
             let kv_cmp = KvPairComparer;
-            let idx_cmp = DataIdComparer::new(&kv_cmp, &data_arena);
+            let ptr_cmp = DataPtrComparer::new(&kv_cmp);
 
             for i in 0..6 {
-                let mut leaf_arr = DataIdOrdArr::new();
+                let mut leaf_arr = DataPtrOrdArr::new();
 
                 let begin = i * 2;
 
-                assert!(leaf_arr.try_insert_item(data[begin], &idx_cmp,).is_succ());
+                assert!(leaf_arr.try_insert_item(data[begin], &ptr_cmp,).is_succ());
 
                 assert!(
                     leaf_arr
-                        .try_insert_item(data[begin + 1], &idx_cmp,)
+                        .try_insert_item(data[begin + 1], &ptr_cmp,)
                         .is_succ()
                 );
 
@@ -194,8 +190,8 @@ mod tests_search_tree_ {
             /*
              * dummy 不再需要作为树的一部分。
              *
-             * 注意：当前 Arena 没有 remove，因此它仍然存在于 Arena
-             * 中，但不会被 Root / Index / Leaf 引用。
+             * 注意：dummy 节点仍然存在于 SlabList 中，但不会被 Root /
+             * Index / Leaf 引用。
              *
              * 对 search 测试而言这没有任何影响。
              */
@@ -211,16 +207,13 @@ mod tests_search_tree_ {
 
                 let next = if i == 5 { leaves[i] } else { leaves[i + 1] };
 
-                let TreeNode::Leaf(leaf) = leaves[i].get_mut(&mut node_arena) else {
+                let TreeNode::Leaf(leaf) = &mut *leaves[i] else {
                     unreachable!()
                 };
 
                 leaf.prev_sibl_ = prev;
                 leaf.next_sibl_ = next;
             }
-
-            let index_ord_cmp = IndexOrdKeyComparer::pick_first_key(&data_arena);
-            let hetero_cmp = HeteroIdxComparer::new(&index_ord_cmp, &data_arena, &node_arena);
 
             /*
              * ---------------------------------------------------------
@@ -255,17 +248,17 @@ mod tests_search_tree_ {
             ];
 
             for (i, &(data0, _, leaf0, data1, leaf1)) in index_ranges.iter().enumerate() {
-                let mut children = IndexIdOrdArr::new();
+                let mut children = IndexPtrOrdArr::new();
 
                 assert!(
                     children
-                        .try_insert_pair_by((data[data0], leaves[leaf0]), &idx_cmp,)
+                        .try_insert_pair_by((data[data0], leaves[leaf0]), &ptr_cmp,)
                         .is_succ()
                 );
 
                 assert!(
                     children
-                        .try_insert_pair_by((data[data0 + 1], leaves[leaf0]), &idx_cmp,)
+                        .try_insert_pair_by((data[data0 + 1], leaves[leaf0]), &ptr_cmp,)
                         .is_succ()
                 );
 
@@ -281,11 +274,11 @@ mod tests_search_tree_ {
                  * 所以重新构造正确的 children。
                  */
 
-                let mut children = IndexIdOrdArr::new();
+                let mut children = IndexPtrOrdArr::new();
 
                 assert!(
                     children
-                        .try_insert_pair_by((data[data0 + 1], leaves[leaf0]), &idx_cmp,)
+                        .try_insert_pair_by((data[data0 + 1], leaves[leaf0]), &ptr_cmp,)
                         .is_succ()
                 );
 
@@ -293,7 +286,7 @@ mod tests_search_tree_ {
                 //     children
                 //         .try_insert_pair_by(
                 //             (data1, leaves[leaf1]),
-                //             &idx_cmp,
+                //             &ptr_cmp,
                 //         )
                 //         .is_succ()
                 // );
@@ -324,7 +317,7 @@ mod tests_search_tree_ {
              * ---------------------------------------------------------
              */
 
-            let mut root_children = IndexIdOrdArr::new();
+            let mut root_children = IndexPtrOrdArr::new();
 
             // for index in indexes {
             //     assert!(

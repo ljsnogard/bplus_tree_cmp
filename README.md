@@ -24,7 +24,7 @@ BPlusTreeCmp 则把排序关系从 Key 中抽离出来，由外部 `Comparer` �
 * **内部索引节点不需要复制 Key**
 * **同一个数据类型可以建立多种不同的排序索引**
 * **数据、索引结构与排序关系彼此解耦**
-* **Arena 对 B+ Tree 隐藏了具体的存储实现**
+* **SlabList 对 B+ Tree 隐藏了具体的存储实现**
 
 ---
 
@@ -184,7 +184,7 @@ BPlusTreeCmp 则不把实际的 `(K, V)` 复制到索引节点。
 数据只保存一次：
 
 ```text
-Data Arena
+Data SlabList
 
 (K, V)
 (K, V)
@@ -195,7 +195,7 @@ Data Arena
 索引节点保存的是：
 
 ```text
-Idx<(K, V)>
+SlotPtr<(K, V)>
 ```
 
 以及对应的：
@@ -229,19 +229,19 @@ BPlusTreeCmp 使用另一种方式：
 ```text
 IndexNode
     │
-    ├── Idx<(K, V)> ────┐
-    ├── Idx<(K, V)> ──┐ │
-    ├── Idx<(K, V)> ┐ │ │
+    ├── SlotPtr<(K, V)> ────┐
+    ├── SlotPtr<(K, V)> ──┐ │
+    ├── SlotPtr<(K, V)> ┐ │ │
     │               │ │ │
     ▼               ▼ ▼ ▼
-Data Arena
+Data SlabList
     │
     ├── (K, V)
     ├── (K, V)
     └── (K, V)
 ```
 
-`Idx<(K,V)>` 是一个**类型化的数据引用**，不是 `(K,V)` 的副本。
+`SlotPtr<(K,V)>` 是一个**类型化的数据引用**，不是 `(K,V)` 的副本。
 
 索引数组可以通过 `Comparer` 对这些引用所指向的数据进行定序。
 
@@ -250,7 +250,7 @@ Data Arena
 ```rust
 OrderedArray<
     M,
-    Idx<(K, V)>,
+    SlotPtr<(K, V)>,
     TreeNodeId<M, K, V>
 >
 ```
@@ -276,9 +276,9 @@ BPlusTreeCmp 将整个问题拆成三个相互独立的部分：
         │  Index / Leaf   │
         └────────┬────────┘
                  │
-                 │ typed index
+                 │ SlotPtr
                  ▼
-              Arena
+              SlabList
                  │
                  ▼
               Data
@@ -323,10 +323,10 @@ Data
   └── (K, V)
 
 Index
-  └── Idx<(K, V)>
+  └── SlotPtr<(K, V)>
 ```
 
-二者通过 typed index 连接。
+二者通过 SlotPtr 连接。
 
 ---
 
@@ -404,7 +404,7 @@ Index 保存：
 ```rust
 OrderedArray<
     M,
-    Idx<(K, V)>,
+    SlotPtr<(K, V)>,
     TreeNodeId<M, K, V>
 >
 ```
@@ -414,7 +414,7 @@ OrderedArray<
 ```text
 Key
   ↓
-Idx<(K,V)>
+SlotPtr<(K,V)>
   ↓
 实际数据
 ```
@@ -434,10 +434,10 @@ TreeNodeId
 Leaf 保存：
 
 ```rust
-OrderedArray<M, Idx<(K, V)>, ()>
+OrderedArray<M, SlotPtr<(K, V)>, ()>
 ```
 
-也就是说 Leaf 同样通过 typed index 指向真正的数据。
+也就是说 Leaf 同样通过 SlotPtr 指向真正的数据。
 
 这使得：
 
@@ -483,7 +483,7 @@ Separator Key
 
 BPlusTreeCmp：
 
-Idx<(K,V)>
+SlotPtr<(K,V)>
       ↓
 找到实际数据
       ↓
@@ -498,110 +498,95 @@ Comparer
 
 ---
 
-# Arena
+# SlabList 与 SlotPtr
 
-BPlusTreeCmp 使用一个轻量的 `Arena<T>` 抽象保存对象，并通过：
+BPlusTreeCmp 使用 `SlabList<T, C>` 保存数据 `(K, V)` 和树节点 `TreeNode`。
+`SlabList` 按 Chunk 批量分配槽位；每次插入返回一个：
 
 ```rust
-Idx<T>
+SlotPtr<T>
 ```
 
-引用对象。
-
-当前实现底层使用 `slab`，但 **B+ Tree 本身不依赖 `slab` 的接口**。
+句柄。`SlotPtr` 直接指向槽位中的元素，因此树不需要再通过 arena 解引用。
 
 树看到的只是：
 
 ```rust
-Arena<T>
-Idx<T>
+SlabList<T, C>
+SlotPtr<T>
 ```
 
 以及：
 
 ```rust
-idx.get(&arena)
-idx.get_mut(&mut arena)
+*slot_ptr
+&mut *slot_ptr
 ```
 
 这样的基本操作。
 
-因此 Arena 是一个明确的抽象边界。
+配置类型 `C` 指定单 Chunk 的 const 大小和 allocator 类型；allocator 实例由
+`SlabList` 自己保存。当前 B+ Tree 使用默认配置
+`SlabListConfig<DEFAULT_CHUNK_BYTES>` 和 `Global` allocator。
 
 当前结构可以概括为：
 
 ```text
 BPlusTree
    │
-   ├── data Arena
+   ├── data SlabList
    │       └── (K, V)
    │
-   └── node Arena
+   └── node SlabList
            └── TreeNode
 ```
 
-未来可以进一步将 Arena 独立出来，允许：
-
-* 使用不同的 Arena 实现
-* 使用外部 Arena
-* 自定义对象生命周期管理
-* 使用不同的内存分配策略
-* 针对持久化、缓存或其他存储需求进行扩展
-
-BPlusTree 本身不应该需要知道底层对象究竟由什么容器保存。
+`SlabList` 是树的数据存储边界；B+ Tree 不需要知道 Chunk 内部如何组织。
 
 ---
 
-# Typed Index
+# Typed Slot Handle
 
-`Idx<T>` 的核心作用是把：
-
-```text
-usize
-```
-
-变成带有类型信息的引用。
-
-概念上：
+`SlotPtr<T>` 的核心作用是把裸指针变成带有类型信息的句柄：
 
 ```rust
-Idx<T>
+SlotPtr<T>
 ```
 
-表示：
+它表示：
 
-> “某个 `Arena<T>` 中对象的位置。”
+> “某个 `SlabList<T>` 槽位中对象的地址。”
 
 它本身不拥有 `T`。
 
 因此：
 
 ```rust
-Idx<(K, V)>
-Idx<TreeNode<M, K, V>>
+SlotPtr<(K, V)>
+SlotPtr<TreeNode<M, K, V>>
 ```
 
-虽然都是索引，但在类型系统中属于完全不同的类型。
+虽然底层都是指针，但在类型系统中属于完全不同的类型。
 
 这使得：
 
 ```text
-Data Index
+Data Handle
 ```
 
 和：
 
 ```text
-Node Index
+Node Handle
 ```
 
 不会被意外混用。
 
-同时，`Idx<T>` 本身不要求 `T: Copy` 或 `T: Clone`；它只是一个带类型标记的索引值。
+同时，`SlotPtr<T>` 本身不要求 `T: Copy` 或 `T: Clone`；它只是 `Copy` 的指针句柄。
 
 ---
 
-# Comparer 与 Index 的组合
+# Comparer 与 SlotPtr 的组合
 
 Comparer 不仅可以比较实际数据：
 
@@ -609,25 +594,25 @@ Comparer 不仅可以比较实际数据：
 K ↔ K
 ```
 
-也可以通过索引适配器参与：
+也可以通过 SlotPtr 适配器参与：
 
 ```text
-Idx<K> ↔ Idx<K>
+SlotPtr<K> ↔ SlotPtr<K>
 ```
 
 或者异构地比较：
 
 ```text
-Idx<L> ↔ Idx<R>
+SlotPtr<L> ↔ SlotPtr<R>
 ```
 
 其基本思想是：
 
 ```text
-Idx
+SlotPtr
  │
  ▼
-Arena
+SlabList
  │
  ▼
 实际对象
@@ -722,15 +707,15 @@ Index 保存数据引用，而不是 Key 副本。
 
 ### 4. Key 不需要 Clone
 
-索引结构只保存 typed index，不复制实际 Key。
+索引结构只保存 SlotPtr，不复制实际 Key。
 
 ### 5. Data 与 Index 分离
 
-数据和树节点分别存储，通过 `Idx<T>` 连接。
+数据和树节点分别存储，通过 `SlotPtr<T>` 连接。
 
-### 6. Arena 与 B+ Tree 解耦
+### 6. SlabList 与 B+ Tree 解耦
 
-树只依赖 Arena 抽象，而不依赖具体底层容器。
+树只依赖 SlabList 抽象，而不依赖具体底层容器。
 
 ### 7. B+ Tree 负责结构，Comparer 负责顺序
 
@@ -763,7 +748,7 @@ Comparer 负责：
 | 异构查询            | 依赖额外机制       | `TrComparer<K, Q>` 原生支持 |
 | 一个数据类型的多个排序     | 通常需要额外包装     | 可以提供多个 Comparer         |
 | 数据与索引           | 容易耦合         | 明确分离                    |
-| 底层存储            | 通常由结构直接决定    | 通过 Arena 抽象             |
+| 底层存储            | 通常由结构直接决定    | 通过 SlabList 抽象             |
 
 ---
 
@@ -775,13 +760,13 @@ Comparer 负责：
 
 * `TrComparer<A, B>` 排序抽象
 * 同构与异构 Comparer
-* typed `Idx<T>`
-* Arena 抽象
+* typed `SlotPtr<T>` 句柄
+* SlabList 抽象
 * Root / Index / Leaf 节点模型
 * `OrderedArray<M, K, V>`
 * 基于 Comparer 的有序数组搜索
 * `(K, V)` 数据模型
-* Index 中通过 `Idx<(K,V)>` 引用数据
+* Index 中通过 `SlotPtr<(K,V)>` 引用数据
 * 面向异构查询的 API 设计
 
 完整的 B+ Tree 插入、节点分裂、删除、搜索以及更高层 API 仍在持续实现中。
@@ -800,7 +785,7 @@ Comparer 负责：
 
 > **B+ Tree 不需要拥有 Key，它只需要拥有能够根据 Comparer 找到正确位置的索引。**
 
-Comparer 让 Key 不必定义自己的排序，也让查询可以完全异构；Arena 和 typed index 则让索引可以引用数据而不是复制数据。
+Comparer 让 Key 不必定义自己的排序，也让查询可以完全异构；SlabList 和 SlotPtr 则让索引可以引用数据而不是复制数据。
 
 最终形成：
 
@@ -818,10 +803,10 @@ Comparer 让 Key 不必定义自己的排序，也让查询可以完全异构；
              │   Index     │
              └──────┬──────┘
                     │
-                 Idx<T>
+                 SlotPtr<T>
                     │
                     ▼
-                  Arena
+                  SlabList
                     │
                     ▼
                  (K, V)

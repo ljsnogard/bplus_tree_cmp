@@ -74,6 +74,16 @@ impl<T> SlotPtr<T> {
     pub(super) const fn as_non_null_(&self) -> NonNull<T> {
         self.ptr_
     }
+
+    /// 构造一个悬垂句柄，仅供测试中作为占位值使用。
+    ///
+    /// 该句柄不能解引用；只用于在节点字段尚未填好时占位。
+    #[cfg(test)]
+    pub(crate) fn dangling_for_test_() -> Self {
+        SlotPtr {
+            ptr_: NonNull::dangling(),
+        }
+    }
 }
 
 impl<T> Copy for SlotPtr<T> {}

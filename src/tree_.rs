@@ -1,16 +1,11 @@
-use core::{
-    borrow::{Borrow, BorrowMut},
-    cmp::Ordering,
-    marker::PhantomData,
-    mem::ManuallyDrop,
-    ops::Deref,
-    ptr,
-};
+use alloc::alloc::Global;
+
+use core::{alloc::Allocator, borrow::Borrow};
 
 use crate::{
-    arena_::Arena,
     comparer_::TrComparer,
-    node_::{TreeNode, TreeNodeId},
+    node_::{TreeNode, TreeNodePtr},
+    slab_list_::{SlabList, SlabListError},
 };
 
 pub struct BPlusTree<const M: usize, C, K, V = ()>
@@ -19,9 +14,9 @@ where
 {
     len_: usize,
     comparer_: C,
-    tree_root_: Option<TreeNodeId<M, K, V>>,
-    data_arena_: Arena<(K, V)>,
-    node_arena_: Arena<TreeNode<M, K, V>>,
+    tree_root_: Option<TreeNodePtr<M, K, V>>,
+    data_arena_: SlabList<(K, V)>,
+    node_arena_: SlabList<TreeNode<M, K, V>>,
 }
 
 impl<const M: usize, C, K, V> BPlusTree<M, C, K, V>
@@ -32,15 +27,21 @@ where
         M
     }
 
-    /// Creates an empty B-tree using `order` as its key comparator.
-    pub const fn new_in(comparer: C) -> Self {
-        Self {
+    /// Creates an empty B-tree using `comparer` as its key comparator.
+    ///
+    /// # Errors
+    ///
+    /// 使用默认 `SlabListConfig<DEFAULT_CHUNK_BYTES>` 创建数据与节点
+    /// `SlabList`；若默认 Chunk 无法容纳至少一个元素，返回
+    /// [`SlabListError`]。
+    pub fn new_in(comparer: C) -> Result<Self, SlabListError> {
+        Ok(Self {
             len_: 0,
             comparer_: comparer,
             tree_root_: Option::None,
-            data_arena_: Arena::new(),
-            node_arena_: Arena::new(),
-        }
+            data_arena_: SlabList::new(Global)?,
+            node_arena_: SlabList::new(Global)?,
+        })
     }
 
     /// Returns the number of entries.

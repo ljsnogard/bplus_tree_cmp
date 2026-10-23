@@ -11,7 +11,6 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
-mod arena_;
 mod comparer_;
 mod node_;
 mod ordered_arr_;
@@ -26,7 +25,3 @@ pub use slab_list_::{
     SlotPtr, TrConfig,
 };
 pub use tree_::BPlusTree;
-
-pub mod x_deps {
-    pub use slab;
-}
