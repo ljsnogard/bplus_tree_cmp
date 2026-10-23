@@ -1,7 +1,6 @@
 //! 基于 Chunk 链表的 SlabList arena。
 
 use core::{
-    alloc::Allocator,
     marker::PhantomData,
     ptr::{self, NonNull},
 };
@@ -13,7 +12,7 @@ use super::{
         ChunkHeader, ChunkLayout, NIL_SLOT, OCCUPIED_BIT, SLOT_INDEX_MASK, Slot, alloc_chunk_,
         chunk_of_slot_, dealloc_chunk_, slot_ptr_at_, slot_self_idx_ptr_, slots_base_,
     },
-    config_::SlabListConfig,
+    config_::{DEFAULT_CHUNK_BYTES, SlabListConfig, TrConfig},
     error_::SlabListError,
     ptr_::SlotPtr,
 };
@@ -39,9 +38,12 @@ use super::{
 ///
 /// 因此槽位可以乱序归还，归还的槽位会压入所属 Chunk 的空闲链表头部。
 ///
-/// Chunk 内存由类型参数 `A` 指定的 [`Allocator`] 分配；默认使用 [`Global`]。
+/// `T` 与配置类型 `C` 是两个独立的泛型参数：`T` 是槽位中的元素类型，`C` 是
+/// 类型级配置，决定单 Chunk 的 const 字节数和 allocator 类型。配置本身不持有
+/// allocator 实例；`allocator_` 由 `SlabList` 保存。
+///
 /// 单 Chunk 的布局、槽位偏移和槽位数不作为独立字段缓存在 `SlabList` 中，
-/// 而是由 [`SlabListConfig`] 结合 `T` 在需要时计算。
+/// 而是由 `C::CHUNK_SIZE` 结合 `T` 在需要时计算。
 ///
 /// `SlabList` 不保存存活元素数量、总容量或 Chunk 数量等使用统计信息；
 /// 它只负责管理 Chunk 链表和槽位的分配/归还。
@@ -50,9 +52,9 @@ use super::{
 ///
 /// ```
 /// use bplustree_cmp::{SlabList, SlabListConfig};
+/// use std::alloc::Global;
 ///
-/// let config = SlabListConfig::new(4096);
-/// let mut arena = SlabList::<u64>::new(config).unwrap();
+/// let mut arena = SlabList::<u64, SlabListConfig<4096>>::new(Global).unwrap();
 ///
 /// let a = arena.insert(10);
 /// let b = arena.insert(20);
@@ -62,9 +64,9 @@ use super::{
 /// assert_eq!(arena.remove(a), 10);
 /// assert_eq!(*b, 20);
 /// ```
-pub struct SlabList<T, A = Global>
+pub struct SlabList<T, C = SlabListConfig<DEFAULT_CHUNK_BYTES>>
 where
-    A: Allocator,
+    C: TrConfig,
 {
     /// 链表头部；为空表示还没有分配任何 Chunk。
     head_: *mut ChunkHeader,
@@ -72,66 +74,31 @@ where
     /// 链表尾部。
     tail_: *mut ChunkHeader,
 
-    /// 创建时使用的 Chunk 配置。
-    config_: SlabListConfig,
+    /// 分配 Chunk 内存所使用的 allocator 实例。
+    ///
+    /// 配置 `C` 只指定它的类型 `C::Allocator`，实例由 `SlabList` 自己保存。
+    allocator_: C::Allocator,
 
-    /// 分配 Chunk 内存所使用的 allocator。
-    allocator_: A,
-
-    /// 表明 `SlabList<T>` 拥有 `T`，并参与 drop check。
-    _marker_: PhantomData<Slot<T>>,
+    /// 表明 `SlabList<T, C>` 拥有 `T`，并参与 drop check。
+    _marker_: PhantomData<(Slot<T>, C)>,
 }
 
-impl<T> SlabList<T, Global> {
-    /// 使用默认的 [`Global`] allocator 和给定 Chunk 配置创建一个空的 `SlabList`。
-    ///
-    /// 创建时不会立即分配 Chunk；第一次 `insert` 时才分配第一个 Chunk。
-    ///
-    /// # Errors
-    ///
-    /// 当配置的 Chunk 字节数无法容纳至少一个 `Slot<T>` 时返回
-    /// [`SlabListError::ChunkTooSmall`]；当计算出的槽位数超过
-    /// [`SlabListConfig::MAX_SLOTS_PER_CHUNK`] 时返回
-    /// [`SlabListError::TooManySlots`]；布局无法表示时返回
-    /// [`SlabListError::LayoutOverflow`]。
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use bplustree_cmp::{SlabList, SlabListConfig};
-    ///
-    /// let arena = SlabList::<u64>::new(SlabListConfig::new(4096)).unwrap();
-    /// assert!(arena.slots_per_chunk() > 0);
-    /// ```
-    pub fn new(config: SlabListConfig) -> Result<Self, SlabListError> {
-        SlabList::new_in(config, Global)
-    }
-
-    /// 使用默认的 [`Global`] allocator 和默认 Chunk 配置创建一个空的 `SlabList`。
-    ///
-    /// 默认单 Chunk 大小为 64 KiB，可通过 [`SlabListConfig::default`] 获取该配置。
-    ///
-    /// # Errors
-    ///
-    /// 与 [`SlabList::new`] 相同。
-    pub fn with_default_config() -> Result<Self, SlabListError> {
-        SlabList::new(SlabListConfig::default())
-    }
-}
-
-impl<T, A> SlabList<T, A>
+impl<T, C> SlabList<T, C>
 where
-    A: Allocator,
+    C: TrConfig,
 {
-    /// 使用指定的 allocator 和 Chunk 配置创建一个空的 `SlabList`。
+    /// 使用给定 allocator 创建一个空的 `SlabList`。
+    ///
+    /// `C` 是类型级配置：它决定 `CHUNK_SIZE` 和 allocator 类型；allocator
+    /// 实例通过参数传入并由 `SlabList` 保存。`T` 与 `C` 是两个独立的泛型参数。
     ///
     /// 创建时不会立即分配 Chunk；第一次 `insert` 时才分配第一个 Chunk。
     ///
     /// # Errors
     ///
-    /// 当配置的 Chunk 字节数无法容纳至少一个 `Slot<T>` 时返回
+    /// 当 `C::CHUNK_SIZE` 无法容纳至少一个 `Slot<T>` 时返回
     /// [`SlabListError::ChunkTooSmall`]；当计算出的槽位数超过
-    /// [`SlabListConfig::MAX_SLOTS_PER_CHUNK`] 时返回
+    /// [`MAX_SLOTS_PER_CHUNK`](crate::MAX_SLOTS_PER_CHUNK) 时返回
     /// [`SlabListError::TooManySlots`]；布局无法表示时返回
     /// [`SlabListError::LayoutOverflow`]。
     ///
@@ -141,52 +108,43 @@ where
     /// use bplustree_cmp::{SlabList, SlabListConfig};
     /// use std::alloc::Global;
     ///
-    /// let arena = SlabList::<u64, _>::new_in(SlabListConfig::new(4096), Global).unwrap();
-    /// assert_eq!(arena.config().chunk_bytes(), 4096);
+    /// let arena = SlabList::<u64, SlabListConfig<4096>>::new(Global).unwrap();
+    /// assert_eq!(arena.chunk_bytes(), 4096);
     /// ```
-    pub fn new_in(config: SlabListConfig, allocator: A) -> Result<Self, SlabListError> {
-        config.chunk_layout_::<T>()?;
+    pub fn new(allocator: C::Allocator) -> Result<Self, SlabListError> {
+        ChunkLayout::for_type::<T>(C::CHUNK_SIZE)?;
 
         Ok(SlabList {
             head_: ptr::null_mut(),
             tail_: ptr::null_mut(),
-            config_: config,
             allocator_: allocator,
             _marker_: PhantomData,
         })
     }
 
-    /// 使用默认 Chunk 配置和指定的 allocator 创建一个空的 `SlabList`。
-    ///
-    /// # Errors
-    ///
-    /// 与 [`SlabList::new_in`] 相同。
-    pub fn with_default_config_in(allocator: A) -> Result<Self, SlabListError> {
-        SlabList::new_in(SlabListConfig::default(), allocator)
-    }
-
-    /// 返回创建时使用的 Chunk 配置。
-    pub const fn config(&self) -> SlabListConfig {
-        self.config_
-    }
-
-    /// 返回创建时指定的 allocator 的引用。
-    pub const fn allocator(&self) -> &A {
+    /// 返回分配 Chunk 内存所使用的 allocator 引用。
+    pub const fn allocator(&self) -> &C::Allocator {
         &self.allocator_
+    }
+
+    /// 返回单 Chunk 的总内存大小（字节）。
+    pub const fn chunk_bytes(&self) -> usize {
+        C::CHUNK_SIZE
     }
 
     /// 返回每个 Chunk 的槽位数。
     ///
-    /// 该值由配置和 `T` 的布局实时计算，不作为独立字段缓存在 `SlabList` 中。
+    /// 该值由 `C::CHUNK_SIZE` 和 `T` 的布局实时计算，不作为独立字段缓存在
+    /// `SlabList` 中。
     pub fn slots_per_chunk(&self) -> usize {
-        self.chunk_layout_().slots_per_chunk_ as usize
+        self.chunk_layout_().slots_per_chunk()
     }
 
-    /// 从配置和 `T` 计算 Chunk 布局。
+    /// 从 `C::CHUNK_SIZE` 和 `T` 计算 Chunk 布局。
     ///
-    /// `new_in` 已经验证过配置，因此这里不应失败。
+    /// `new` 已经验证过配置，因此这里不应失败。
     fn chunk_layout_(&self) -> ChunkLayout {
-        match self.config_.chunk_layout_::<T>() {
+        match ChunkLayout::for_type::<T>(C::CHUNK_SIZE) {
             Ok(layout) => layout,
             Err(_) => unreachable!("SlabList 创建时已校验 Chunk 配置"),
         }
@@ -205,8 +163,9 @@ where
     ///
     /// ```
     /// use bplustree_cmp::{SlabList, SlabListConfig};
+    /// use std::alloc::Global;
     ///
-    /// let mut arena = SlabList::<u64>::new(SlabListConfig::new(4096)).unwrap();
+    /// let mut arena = SlabList::<u64, SlabListConfig<4096>>::new(Global).unwrap();
     /// let a = arena.insert(1);
     /// let b = arena.insert(2);
     ///
@@ -268,8 +227,9 @@ where
     ///
     /// ```
     /// use bplustree_cmp::{SlabList, SlabListConfig};
+    /// use std::alloc::Global;
     ///
-    /// let mut arena = SlabList::<u64>::new(SlabListConfig::new(4096)).unwrap();
+    /// let mut arena = SlabList::<u64, SlabListConfig<4096>>::new(Global).unwrap();
     /// let a = arena.insert(1);
     /// let b = arena.insert(2);
     ///
@@ -363,9 +323,9 @@ where
 
     /// 使用本 arena 的 allocator 分配一个新 Chunk 并插入链表头部。
     fn alloc_chunk_front_(&mut self, chunk_layout: ChunkLayout) -> *mut ChunkHeader {
-        // SAFETY: chunk_layout 由 config.chunk_layout_::<T>() 成功计算，
-        // 且 allocator_ 就是本 arena 构造时指定的 allocator。
-        let chunk = unsafe { alloc_chunk_::<T, A>(&self.allocator_, chunk_layout) };
+        // SAFETY: chunk_layout 由 C::CHUNK_SIZE 与 T 成功计算，
+        // 且 allocator_ 的类型就是 C::Allocator。
+        let chunk = unsafe { alloc_chunk_::<T, _>(&self.allocator_, chunk_layout) };
 
         // SAFETY: chunk 是新分配的有效 Chunk；head_/tail_ 要么为空，
         // 要么指向链表中仍然有效的 Chunk。
@@ -480,9 +440,22 @@ where
     }
 }
 
-impl<T, A> Drop for SlabList<T, A>
+impl<T> SlabList<T, SlabListConfig<DEFAULT_CHUNK_BYTES>> {
+    /// 使用默认配置创建一个空的 `SlabList`。
+    ///
+    /// 默认配置使用 64 KiB 的单 Chunk 大小和 [`Global`] allocator。
+    ///
+    /// # Errors
+    ///
+    /// 与 [`SlabList::new`] 相同。
+    pub fn with_default_config() -> Result<Self, SlabListError> {
+        SlabList::new(Global)
+    }
+}
+
+impl<T, C> Drop for SlabList<T, C>
 where
-    A: Allocator,
+    C: TrConfig,
 {
     fn drop(&mut self) {
         let chunk_layout = self.chunk_layout_();
@@ -524,7 +497,10 @@ mod tests {
     };
     use std::rc::Rc;
 
-    use super::super::chunk_::slot_offset_;
+    use super::super::{
+        chunk_::{Slot, slot_offset_},
+        config_::MAX_SLOTS_PER_CHUNK,
+    };
     use super::*;
 
     /// 一个把分配/释放次数记录在 `Rc<Cell<_>>` 中的 allocator。
@@ -550,36 +526,48 @@ mod tests {
         }
     }
 
-    /// 构造一个刚好容纳 `slots` 个槽位的 Chunk 配置。
-    fn config_for_slots_<T>(slots: usize) -> SlabListConfig {
-        let offset = slot_offset_::<T>().expect("Chunk header 的偏移应当可以计算");
-        let stride = size_of::<Slot<T>>();
-        SlabListConfig::new(offset + stride * slots)
+    /// 计算刚好容纳 `slots` 个槽位的 Chunk 字节数。
+    const fn chunk_bytes_for_slots_<T>(slots: usize) -> usize {
+        let offset = match slot_offset_::<T>() {
+            Some(offset) => offset,
+            None => panic!("Chunk header 的偏移应当可以计算"),
+        };
+        offset + size_of::<Slot<T>>() * slots
     }
+
+    /// 每 Chunk 4 个 `u32` 槽位的配置类型。
+    type U32Cfg4 = SlabListConfig<{ chunk_bytes_for_slots_::<u32>(4) }>;
+
+    /// 每 Chunk 2 个 `u32` 槽位的配置类型。
+    type U32Cfg2 = SlabListConfig<{ chunk_bytes_for_slots_::<u32>(2) }>;
+
+    /// 每 Chunk 4 个 ZST 槽位的配置类型。
+    type ZstCfg4 = SlabListConfig<{ chunk_bytes_for_slots_::<()>(4) }>;
+
+    /// 使用 `CountingAlloc` 的每 Chunk 2 个 `u32` 槽位配置。
+    type CountingCfg2 = SlabListConfig<{ chunk_bytes_for_slots_::<u32>(2) }, CountingAlloc>;
 
     /// 测试目标：验证 Chunk 字节数不足时拒绝创建 SlabList。
     /// Test goal: Verify that a chunk configuration too small for one slot is rejected.
     ///
-    /// 测试手段：分别用 0 字节和不足 `header + 一个槽位` 的字节数构造
-    /// `SlabList<u32>`。
-    /// Test method: Build `SlabList<u32>` with zero bytes and with fewer bytes than
-    /// `header + one slot`.
+    /// 测试手段：分别用 `CHUNK_SIZE = 0` 和不足 `header + 一个槽位` 的 const
+    /// 配置构造 `SlabList<u32>`。
+    /// Test method: Build `SlabList<u32>` with a `CHUNK_SIZE = 0` config and with a
+    /// const config smaller than `header + one slot`.
     ///
     /// 判定标准：两次都返回 `SlabListError::ChunkTooSmall`。
     /// Assertions: Both calls return `SlabListError::ChunkTooSmall`.
     #[test]
     fn test_new_rejects_too_small_chunk() {
         assert_eq!(
-            SlabList::<u32>::new(SlabListConfig::new(0)).err(),
+            SlabList::<u32, SlabListConfig<0>>::new(Global).err(),
             Some(SlabListError::ChunkTooSmall)
         );
 
-        let offset = slot_offset_::<u32>().expect("Chunk header 的偏移应当可以计算");
-        let stride = size_of::<Slot<u32>>();
-        let bytes = offset + stride - 1;
+        const TOO_SMALL: usize = chunk_bytes_for_slots_::<u32>(1) - 1;
 
         assert_eq!(
-            SlabList::<u32>::new(SlabListConfig::new(bytes)).err(),
+            SlabList::<u32, SlabListConfig<TOO_SMALL>>::new(Global).err(),
             Some(SlabListError::ChunkTooSmall)
         );
     }
@@ -588,21 +576,18 @@ mod tests {
     /// Test goal: Verify that a chunk configuration implying more than 2^15 slots is rejected.
     ///
     /// 测试手段：为 `u8` 构造一个刚好能容纳
-    /// `MAX_SLOTS_PER_CHUNK + 1` 个槽位的 Chunk 字节数。
-    /// Test method: For `u8`, build chunk bytes that fit exactly
+    /// `MAX_SLOTS_PER_CHUNK + 1` 个槽位的 const 配置。
+    /// Test method: For `u8`, use a const config that fits exactly
     /// `MAX_SLOTS_PER_CHUNK + 1` slots.
     ///
     /// 判定标准：创建返回 `SlabListError::TooManySlots`。
     /// Assertions: Creation returns `SlabListError::TooManySlots`.
     #[test]
     fn test_new_rejects_too_many_slots() {
-        let offset = slot_offset_::<u8>().expect("Chunk header 的偏移应当可以计算");
-        let stride = size_of::<Slot<u8>>();
-        let slots = SlabListConfig::MAX_SLOTS_PER_CHUNK + 1;
-        let bytes = offset + stride * slots;
+        const TOO_MANY: usize = chunk_bytes_for_slots_::<u8>(MAX_SLOTS_PER_CHUNK + 1);
 
         assert_eq!(
-            SlabList::<u8>::new(SlabListConfig::new(bytes)).err(),
+            SlabList::<u8, SlabListConfig<TOO_MANY>>::new(Global).err(),
             Some(SlabListError::TooManySlots)
         );
     }
@@ -610,10 +595,10 @@ mod tests {
     /// 测试目标：验证基本插入、Deref/DerefMut 以及乱序归还。
     /// Test goal: Verify basic insertion, Deref/DerefMut, and out-of-order removal.
     ///
-    /// 测试手段：在可容纳 4 个槽位的 arena 中插入 3 个 `u32`，通过句柄修改其中一个，
+    /// 测试手段：在每 Chunk 4 个槽位的 arena 中插入 3 个 `u32`，通过句柄修改其中一个，
     /// 然后乱序移除并重新插入。
-    /// Test method: Insert three `u32` values into an arena with four slots, mutate one
-    /// through its handle, then remove out of order and insert again.
+    /// Test method: Insert three `u32` values into an arena with four slots per chunk,
+    /// mutate one through its handle, then remove out of order and insert again.
     ///
     /// 判定标准：句柄读写得到预期值；乱序移除返回正确的原值；重新插入后所有槽位
     /// 仍可正常使用。
@@ -621,7 +606,7 @@ mod tests {
     /// the correct original values; all slots remain usable after reinsertion.
     #[test]
     fn test_insert_deref_and_remove_out_of_order() {
-        let mut arena = SlabList::<u32>::new(config_for_slots_::<u32>(4)).expect("配置应当有效");
+        let mut arena = SlabList::<u32, U32Cfg4>::new(Global).expect("配置应当有效");
 
         assert_eq!(arena.slots_per_chunk(), 4);
 
@@ -660,7 +645,7 @@ mod tests {
     /// Assertions: The new handles have the same addresses as the just-freed handles.
     #[test]
     fn test_free_list_reuses_most_recent_slot() {
-        let mut arena = SlabList::<u32>::new(config_for_slots_::<u32>(4)).expect("配置应当有效");
+        let mut arena = SlabList::<u32, U32Cfg4>::new(Global).expect("配置应当有效");
 
         let a = arena.insert(1);
         let b = arena.insert(2);
@@ -693,7 +678,7 @@ mod tests {
     /// slot as well.
     #[test]
     fn test_chunk_growth_and_move_to_head() {
-        let mut arena = SlabList::<u32>::new(config_for_slots_::<u32>(2)).expect("配置应当有效");
+        let mut arena = SlabList::<u32, U32Cfg2>::new(Global).expect("配置应当有效");
 
         let a = arena.insert(0);
         let _b = arena.insert(1);
@@ -741,33 +726,34 @@ mod tests {
     /// dropped, meaning only the two live elements were dropped by the arena.
     #[test]
     fn test_drop_drops_only_live_elements() {
-        struct DropProbe<'a> {
-            counter_: &'a Cell<usize>,
+        struct DropProbe {
+            counter_: Rc<Cell<usize>>,
             value_: u32,
         }
 
-        impl Drop for DropProbe<'_> {
+        impl Drop for DropProbe {
             fn drop(&mut self) {
                 self.counter_.set(self.counter_.get() + 1);
             }
         }
 
-        let counter = Cell::new(0);
+        type DropCfg2 = SlabListConfig<{ chunk_bytes_for_slots_::<DropProbe>(2) }>;
+
+        let counter = Rc::new(Cell::new(0));
 
         {
-            let mut arena = SlabList::<DropProbe<'_>>::new(config_for_slots_::<DropProbe<'_>>(2))
-                .expect("配置应当有效");
+            let mut arena = SlabList::<DropProbe, DropCfg2>::new(Global).expect("配置应当有效");
 
             let a = arena.insert(DropProbe {
-                counter_: &counter,
+                counter_: Rc::clone(&counter),
                 value_: 1,
             });
             let _b = arena.insert(DropProbe {
-                counter_: &counter,
+                counter_: Rc::clone(&counter),
                 value_: 2,
             });
             let _c = arena.insert(DropProbe {
-                counter_: &counter,
+                counter_: Rc::clone(&counter),
                 value_: 3,
             });
 
@@ -793,7 +779,7 @@ mod tests {
     /// reuses the freed slot address.
     #[test]
     fn test_zero_sized_type_slots() {
-        let mut arena = SlabList::<()>::new(config_for_slots_::<()>(4)).expect("配置应当有效");
+        let mut arena = SlabList::<(), ZstCfg4>::new(Global).expect("配置应当有效");
 
         let a = arena.insert(());
         let b = arena.insert(());
@@ -822,7 +808,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "freed or invalid SlotPtr")]
     fn test_double_remove_panics() {
-        let mut arena = SlabList::<u32>::new(config_for_slots_::<u32>(2)).expect("配置应当有效");
+        let mut arena = SlabList::<u32, U32Cfg2>::new(Global).expect("配置应当有效");
 
         let a = arena.insert(1);
         assert_eq!(arena.remove(a), 1);
@@ -836,26 +822,52 @@ mod tests {
     /// 测试手段：使用 `with_default_config` 创建 `SlabList<u32>`。
     /// Test method: Create `SlabList<u32>` through `with_default_config`.
     ///
-    /// 判定标准：配置字节数与默认配置一致；每 Chunk 槽位数大于 0；尚未分配 Chunk。
-    /// Assertions: The configured chunk bytes match the default configuration; slots per
-    /// chunk are positive; no chunk is allocated yet.
+    /// 判定标准：Chunk 字节数与默认常量一致；每 Chunk 槽位数大于 0；尚未分配 Chunk。
+    /// Assertions: Chunk bytes match the default constant; slots per chunk are positive;
+    /// no chunk is allocated yet.
     #[test]
     fn test_default_config() {
         let arena = SlabList::<u32>::with_default_config().expect("默认配置应当有效");
 
-        assert_eq!(
-            arena.config().chunk_bytes(),
-            SlabListConfig::default().chunk_bytes()
-        );
+        assert_eq!(arena.chunk_bytes(), DEFAULT_CHUNK_BYTES);
         assert!(arena.slots_per_chunk() > 0);
-        assert_eq!(
-            arena
-                .config()
-                .slots_per_chunk::<u32>()
-                .expect("配置应当有效"),
-            arena.slots_per_chunk()
-        );
         assert_eq!(arena.chunk_count_(), 0);
+    }
+
+    /// 测试目标：验证自定义 `TrConfig` 实现可以作为 `SlabList` 的配置参数。
+    /// Test goal: Verify that a custom `TrConfig` implementation can be used as the
+    /// configuration parameter of `SlabList`.
+    ///
+    /// 测试手段：定义一个只指定 allocator 类型和 `CHUNK_SIZE` 的自定义配置类型，
+    /// 用 `SlabList<u32, TestConfig>` 创建 arena 并插入 3 个元素。
+    /// Test method: Define a custom config that only specifies the allocator type and
+    /// `CHUNK_SIZE`, create `SlabList<u32, TestConfig>`, and insert three elements.
+    ///
+    /// 判定标准：元素可正常读写，`slots_per_chunk` 来自自定义配置的 `CHUNK_SIZE`。
+    /// Assertions: Elements can be read and written normally, and `slots_per_chunk`
+    /// reflects the custom config's `CHUNK_SIZE`.
+    #[test]
+    fn test_custom_config_is_used() {
+        struct TestConfig;
+
+        impl TrConfig for TestConfig {
+            type Allocator = Global;
+
+            const CHUNK_SIZE: usize = chunk_bytes_for_slots_::<u32>(2);
+        }
+
+        let mut arena = SlabList::<u32, TestConfig>::new(Global).expect("配置应当有效");
+
+        assert_eq!(arena.chunk_bytes(), chunk_bytes_for_slots_::<u32>(2));
+        assert_eq!(arena.slots_per_chunk(), 2);
+
+        let a = arena.insert(1);
+        let b = arena.insert(2);
+        let c = arena.insert(3);
+
+        assert_eq!(*a, 1);
+        assert_eq!(*b, 2);
+        assert_eq!(*c, 3);
     }
 
     /// 测试目标：验证外部 `Allocator` 被用于 Chunk 的分配与释放。
@@ -882,8 +894,7 @@ mod tests {
         };
 
         {
-            let mut arena = SlabList::<u32, _>::new_in(config_for_slots_::<u32>(2), allocator)
-                .expect("配置应当有效");
+            let mut arena = SlabList::<u32, CountingCfg2>::new(allocator).expect("配置应当有效");
 
             assert_eq!(allocs.get(), 0);
 

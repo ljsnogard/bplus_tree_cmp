@@ -21,7 +21,10 @@ mod tree_;
 
 pub use comparer_::{OrdComparer, TrComparer};
 pub use ordered_arr_::{Iter, OrderedArray, TryInsertResult};
-pub use slab_list_::{SlabList, SlabListConfig, SlabListError, SlotPtr};
+pub use slab_list_::{
+    ChunkLayout, DEFAULT_CHUNK_BYTES, MAX_SLOTS_PER_CHUNK, SlabList, SlabListConfig, SlabListError,
+    SlotPtr, TrConfig,
+};
 pub use tree_::BPlusTree;
 
 pub mod x_deps {

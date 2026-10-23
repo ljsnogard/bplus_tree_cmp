@@ -32,62 +32,125 @@ use core::{
 
 use alloc::alloc::handle_alloc_error;
 
-use super::{config_::SlabListConfig, error_::SlabListError};
+use super::{config_::MAX_SLOTS_PER_CHUNK, error_::SlabListError};
 
 /// `self_idx_` 的 occupied 标记位。
-pub(crate) const OCCUPIED_BIT: u16 = 1 << 15;
+pub(super) const OCCUPIED_BIT: u16 = 1 << 15;
 
 /// 从 `self_idx_` 中提取槽号时使用的掩码。
-pub(crate) const SLOT_INDEX_MASK: u16 = OCCUPIED_BIT - 1;
+pub(super) const SLOT_INDEX_MASK: u16 = OCCUPIED_BIT - 1;
 
 /// 空闲链表结束标记。
-pub(crate) const NIL_SLOT: u16 = u16::MAX;
+pub(super) const NIL_SLOT: u16 = u16::MAX;
 
 /// Chunk 头，位于每个 Chunk 分配内存的起始位置。
 #[repr(C)]
-pub(crate) struct ChunkHeader {
+pub(super) struct ChunkHeader {
     /// 前一个 Chunk；链表头部为 null。
-    pub(crate) prev_: *mut ChunkHeader,
+    pub(super) prev_: *mut ChunkHeader,
 
     /// 后一个 Chunk；链表尾部为 null。
-    pub(crate) next_: *mut ChunkHeader,
+    pub(super) next_: *mut ChunkHeader,
 
     /// 空闲链表头部的槽号；没有空闲槽时为 [`NIL_SLOT`]。
-    pub(crate) free_head_: u16,
+    pub(super) free_head_: u16,
 
     /// 当前空闲槽数量。
-    pub(crate) free_count_: u16,
+    pub(super) free_count_: u16,
 
     /// 本 Chunk 的槽位总数。
-    pub(crate) capacity_: u16,
+    pub(super) capacity_: u16,
 }
 
 /// 一个槽位：元素数据在前，两个 u16 元数据在后。
 #[repr(C)]
-pub(crate) struct Slot<T> {
+pub(super) struct Slot<T> {
     /// 尚未初始化或正在使用的元素。
-    pub(crate) value_: MaybeUninit<T>,
+    pub(super) value_: MaybeUninit<T>,
 
     /// 低 15 位是槽号，最高位是 occupied 标记。
-    pub(crate) self_idx_: u16,
+    pub(super) self_idx_: u16,
 
     /// 空闲链表中的下一个槽号；[`NIL_SLOT`] 表示没有下一个空闲槽。
-    pub(crate) next_free_: u16,
+    pub(super) next_free_: u16,
 }
 
-/// 由 [`SlabListConfig`] 与具体元素类型 `T` 计算出的 Chunk 布局。
+/// 由 `TrConfig` 与具体元素类型 `T` 计算出的 Chunk 布局。
 ///
-/// 该值只在需要时临时计算，不缓存在 `SlabList` 中。
+/// 该值只在需要时临时计算，不作为独立字段缓存在 `SlabList` 中。
+///
+/// # Examples
+///
+/// ```
+/// use bplustree_cmp::ChunkLayout;
+///
+/// let layout = ChunkLayout::for_type::<u64>(4096).unwrap();
+/// assert!(layout.slots_per_chunk() > 0);
+/// assert_eq!(layout.slot_offset() % 2, 0);
+/// ```
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ChunkLayout {
+pub struct ChunkLayout {
     /// 单 Chunk 的分配布局。
-    pub(crate) layout_: Layout,
+    pub(super) layout_: Layout,
 
     /// 槽位数组相对于 Chunk 基址的偏移。
-    pub(crate) slot_offset_: usize,
+    pub(super) slot_offset_: usize,
 
     /// 每个 Chunk 的槽位数。
-    pub(crate) slots_per_chunk_: u16,
+    pub(super) slots_per_chunk_: u16,
+}
+
+impl ChunkLayout {
+    /// 根据单 Chunk 字节数与具体元素类型 `T` 计算布局。
+    ///
+    /// # Errors
+    ///
+    /// - Chunk 字节数不足以容纳 header、对齐填充和至少一个槽位时返回
+    ///   [`SlabListError::ChunkTooSmall`]。
+    /// - 槽位数超过 [`MAX_SLOTS_PER_CHUNK`] 时返回
+    ///   [`SlabListError::TooManySlots`]。
+    /// - 布局无法表示时返回 [`SlabListError::LayoutOverflow`]。
+    pub fn for_type<T>(chunk_bytes: usize) -> Result<Self, SlabListError> {
+        let slot_offset = slot_offset_::<T>().ok_or(SlabListError::LayoutOverflow)?;
+        let stride = size_of::<Slot<T>>();
+        debug_assert!(stride > 0, "Slot<T> 至少包含两个 u16 元数据");
+
+        let available = chunk_bytes
+            .checked_sub(slot_offset)
+            .ok_or(SlabListError::ChunkTooSmall)?;
+        let slots = available / stride;
+
+        if slots == 0 {
+            return Err(SlabListError::ChunkTooSmall);
+        }
+        if slots > MAX_SLOTS_PER_CHUNK {
+            return Err(SlabListError::TooManySlots);
+        }
+
+        let layout = Layout::from_size_align(chunk_bytes, chunk_align_::<T>())
+            .map_err(|_| SlabListError::LayoutOverflow)?;
+
+        Ok(ChunkLayout {
+            layout_: layout,
+            slot_offset_: slot_offset,
+            slots_per_chunk_: slots as u16,
+        })
+    }
+
+    /// 返回单 Chunk 的分配布局。
+    pub const fn layout(&self) -> Layout {
+        self.layout_
+    }
+
+    /// 返回槽位数组相对于 Chunk 基址的偏移。
+    pub const fn slot_offset(&self) -> usize {
+        self.slot_offset_
+    }
+
+    /// 返回每个 Chunk 的槽位数。
+    pub const fn slots_per_chunk(&self) -> usize {
+        self.slots_per_chunk_ as usize
+    }
 }
 
 /// 把 `value` 向上对齐到 `align`。
@@ -106,58 +169,22 @@ const fn align_up_(value: usize, align: usize) -> Option<usize> {
 /// 偏移会按 `Slot<T>` 的对齐要求向上取整。Chunk 分配本身按
 /// `max(align_of::<ChunkHeader>(), align_of::<Slot<T>>())` 对齐，
 /// 因此基址加上该偏移后仍然满足 `Slot<T>` 的对齐要求。
-pub(crate) fn slot_offset_<T>() -> Option<usize> {
+pub(super) const fn slot_offset_<T>() -> Option<usize> {
     align_up_(size_of::<ChunkHeader>(), align_of::<Slot<T>>())
 }
 
 /// 返回 Chunk 分配所需的整体对齐。
-pub(crate) fn chunk_align_<T>() -> usize {
+fn chunk_align_<T>() -> usize {
     align_of::<ChunkHeader>().max(align_of::<Slot<T>>())
-}
-
-/// 根据配置的 Chunk 字节数计算布局、槽位数组偏移与槽位数。
-///
-/// # Errors
-///
-/// - Chunk 字节数不足以容纳 header、对齐填充和至少一个槽位时返回
-///   [`SlabListError::ChunkTooSmall`]。
-/// - 槽位数超过 [`SlabListConfig::MAX_SLOTS_PER_CHUNK`] 时返回
-///   [`SlabListError::TooManySlots`]。
-/// - 布局无法表示时返回 [`SlabListError::LayoutOverflow`]。
-pub(crate) fn layout_for_<T>(chunk_bytes: usize) -> Result<ChunkLayout, SlabListError> {
-    let slot_offset = slot_offset_::<T>().ok_or(SlabListError::LayoutOverflow)?;
-    let stride = size_of::<Slot<T>>();
-    debug_assert!(stride > 0, "Slot<T> 至少包含两个 u16 元数据");
-
-    let available = chunk_bytes
-        .checked_sub(slot_offset)
-        .ok_or(SlabListError::ChunkTooSmall)?;
-    let slots = available / stride;
-
-    if slots == 0 {
-        return Err(SlabListError::ChunkTooSmall);
-    }
-    if slots > SlabListConfig::MAX_SLOTS_PER_CHUNK {
-        return Err(SlabListError::TooManySlots);
-    }
-
-    let layout = Layout::from_size_align(chunk_bytes, chunk_align_::<T>())
-        .map_err(|_| SlabListError::LayoutOverflow)?;
-
-    Ok(ChunkLayout {
-        layout_: layout,
-        slot_offset_: slot_offset,
-        slots_per_chunk_: slots as u16,
-    })
 }
 
 /// 返回 Chunk 中槽位数组的起始地址。
 ///
 /// # Safety
 ///
-/// - `chunk` 必须指向一个按 `layout_for_::<T>` 分配并初始化的 Chunk。
-/// - `slot_offset` 必须等于 `slot_offset_::<T>()`，且该 Chunk 至少有一个槽位。
-pub(crate) unsafe fn slots_base_<T>(chunk: *mut ChunkHeader, slot_offset: usize) -> *mut Slot<T> {
+/// - `chunk` 必须指向一个按 [`ChunkLayout::for_type`] 分配并初始化的 Chunk。
+/// - `slot_offset` 必须等于 [`ChunkLayout::slot_offset`]，且该 Chunk 至少有一个槽位。
+pub(super) unsafe fn slots_base_<T>(chunk: *mut ChunkHeader, slot_offset: usize) -> *mut Slot<T> {
     // SAFETY: 调用者保证 chunk 指向有效的 Chunk 分配，slot_offset 在分配范围内
     // 且按 Slot<T> 对齐。Chunk 基址本身按 Slot<T> 对齐，因此相加后仍然对齐。
     unsafe { (chunk as *mut u8).add(slot_offset).cast::<Slot<T>>() }
@@ -169,7 +196,7 @@ pub(crate) unsafe fn slots_base_<T>(chunk: *mut ChunkHeader, slot_offset: usize)
 ///
 /// - `chunk`、`slot_offset` 的要求同 [`slots_base_`]。
 /// - `idx` 必须小于该 Chunk 的 `capacity_`。
-pub(crate) unsafe fn slot_ptr_at_<T>(
+pub(super) unsafe fn slot_ptr_at_<T>(
     chunk: *mut ChunkHeader,
     slot_offset: usize,
     idx: u16,
@@ -183,7 +210,7 @@ pub(crate) unsafe fn slot_ptr_at_<T>(
 /// # Safety
 ///
 /// `slot` 必须指向一个已经开始初始化、且元数据仍然有效的 `Slot<T>`。
-pub(crate) unsafe fn slot_self_idx_ptr_<T>(slot: *mut Slot<T>) -> *mut u16 {
+pub(super) unsafe fn slot_self_idx_ptr_<T>(slot: *mut Slot<T>) -> *mut u16 {
     // SAFETY: 调用者保证 slot 有效；addr_of_mut! 不会创建对字段的引用。
     unsafe { ptr::addr_of_mut!((*slot).self_idx_) }
 }
@@ -202,7 +229,7 @@ pub(crate) unsafe fn slot_self_idx_ptr_<T>(slot: *mut Slot<T>) -> *mut u16 {
 /// - `slot` 必须指向一个有效 Chunk 中的有效槽位。
 /// - `idx` 必须等于该槽位 `self_idx_` 的低 15 位。
 /// - `slot_offset` 必须等于 `slot_offset_::<T>()`。
-pub(crate) unsafe fn chunk_of_slot_<T>(
+pub(super) unsafe fn chunk_of_slot_<T>(
     slot: *mut Slot<T>,
     idx: u16,
     slot_offset: usize,
@@ -221,11 +248,12 @@ pub(crate) unsafe fn chunk_of_slot_<T>(
 ///
 /// # Safety
 ///
-/// - `chunk_layout` 必须来自 [`layout_for_::<T>`] 的成功计算。
+/// - `chunk_layout` 必须来自 `TrConfig::chunk_layout::<T>` 或
+///   [`ChunkLayout::for_type::<T>`] 的成功计算。
 /// - `allocator` 必须能够分配 `chunk_layout.layout_` 描述的布局。
 ///
 /// 分配失败时按全局 allocator 的错误处理器处理（通常是 abort）。
-pub(crate) unsafe fn alloc_chunk_<T, A>(
+pub(super) unsafe fn alloc_chunk_<T, A>(
     allocator: &A,
     chunk_layout: ChunkLayout,
 ) -> *mut ChunkHeader
@@ -248,7 +276,7 @@ where
     // SAFETY:
     // - base 指向一块至少 layout.size() 字节的有效内存。
     // - slot_offset + slots * size_of::<Slot<T>>() <= layout.size()，
-    //   这个不等式由 layout_for_ 的计算保证。
+    //   这个不等式由 ChunkLayout::for_type 的计算保证。
     // - base 按 chunk_align_::<T>() 对齐，slot_offset 按 Slot<T> 对齐，
     //   因此槽位数组的每个元素都满足 Slot<T> 的对齐要求。
     unsafe {
@@ -285,7 +313,7 @@ where
 ///
 /// - `chunk` 必须由同一个 allocator 的 `alloc_chunk_` 返回，且尚未被释放。
 /// - `layout` 必须与分配时使用的 layout 完全一致。
-pub(crate) unsafe fn dealloc_chunk_<A>(allocator: &A, chunk: *mut ChunkHeader, layout: Layout)
+pub(super) unsafe fn dealloc_chunk_<A>(allocator: &A, chunk: *mut ChunkHeader, layout: Layout)
 where
     A: Allocator,
 {

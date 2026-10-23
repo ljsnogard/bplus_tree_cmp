@@ -28,8 +28,9 @@ use core::{
 ///
 /// ```
 /// use bplustree_cmp::{SlabList, SlabListConfig};
+/// use std::alloc::Global;
 ///
-/// let mut arena = SlabList::<u64>::new(SlabListConfig::new(4096)).unwrap();
+/// let mut arena = SlabList::<u64, SlabListConfig<4096>>::new(Global).unwrap();
 /// let mut ptr = arena.insert(7);
 ///
 /// assert_eq!(*ptr, 7);
@@ -45,7 +46,7 @@ impl<T> SlotPtr<T> {
     /// 由 arena 内部构造句柄。
     ///
     /// 调用者必须保证 `ptr` 指向某个已经初始化的槽位。
-    pub(crate) const fn from_raw_(ptr: NonNull<T>) -> Self {
+    pub(super) const fn from_raw_(ptr: NonNull<T>) -> Self {
         SlotPtr { ptr_: ptr }
     }
 
@@ -57,8 +58,9 @@ impl<T> SlotPtr<T> {
     ///
     /// ```
     /// use bplustree_cmp::{SlabList, SlabListConfig};
+    /// use std::alloc::Global;
     ///
-    /// let mut arena = SlabList::<u64>::new(SlabListConfig::new(4096)).unwrap();
+    /// let mut arena = SlabList::<u64, SlabListConfig<4096>>::new(Global).unwrap();
     /// let ptr = arena.insert(1);
     /// assert!(!ptr.as_ptr().is_null());
     /// ```
@@ -69,7 +71,7 @@ impl<T> SlotPtr<T> {
     /// 返回内部的 [`NonNull<T>`]。
     ///
     /// 仅供 crate 内部的 arena 操作使用。
-    pub(crate) const fn as_non_null_(&self) -> NonNull<T> {
+    pub(super) const fn as_non_null_(&self) -> NonNull<T> {
         self.ptr_
     }
 }
