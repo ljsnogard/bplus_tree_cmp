@@ -1,222 +1,145 @@
-use core::{cmp, marker::PhantomData};
+//! B+ Tree 的节点类型。
+//!
+//! 节点只保存 `SlotPtr`，不拥有实际的 `(K, V)`：
+//!
+//! - 叶子保存 `(SlotPtr<(K, V)>, ())`；
+//! - 索引保存 `(SlotPtr<(K, V)>, TreeNodePtr)`，其中 `SlotPtr` 是该孩子子树
+//!   最大 key 的引用，`TreeNodePtr` 指向孩子节点。
+//!
+//! 树的 root 和首尾叶由 [`crate::BPlusTree`] 自己持有。root 可以是
+//! [`TreeNode::Leaf`]，也可以是 [`TreeNode::Index`]。
 
-use crate::{comparer_::TrComparer, ordered_arr_::OrderedArray, slab_list_::SlotPtr};
+use crate::{ordered_arr_::OrderedArray, slab_list_::SlotPtr};
 
-/// OrderedArray type used in DataLeaf, the actual storage type is `(SlotPtr<(K, V)>, ())`.
-///
-/// This needs a comparer on `SlotPtr<(K, V)>` that dereferences the handle to the
-/// `(K, V)` pair in the data SlabList and then compares the pair.
-///
-/// `HomoSlotComparer<'_, (K, V), C>` can be used, where `C: TrComparer<(K, V)>`
-/// is the real comparer on `(K, V)`.
-pub type DataPtrOrdArr<const M: usize, K, V = ()> = OrderedArray<M, SlotPtr<(K, V)>, ()>;
+/// 叶子节点使用的有序数组，实际存储类型为 `(SlotPtr<(K, V)>, ())`。
+pub(crate) type DataPtrOrdArr<const M: usize, K, V = ()> = OrderedArray<M, SlotPtr<(K, V)>, ()>;
 
-/// OrderedArray type used in IndexNode and RootNode, the actual storage type is
-/// `(SlotPtr<(K, V)>, TreeNodePtr<M, K, V>)`.
+/// 索引节点与 root 使用的有序数组，实际存储类型为
+/// `(SlotPtr<(K, V)>, TreeNodePtr<M, K, V>)`。
 ///
-/// The separator key is a handle to the actual `(K, V)` pair; it is not copied.
-/// `IndexKeyComparer` / `IndexOrdKeyComparer` compare a query key against the
-/// separator by dereferencing that handle.
-pub type IndexPtrOrdArr<const M: usize, K, V> =
+/// 每个索引项的分隔 key 是孩子子树最大 key 的句柄，而不是 Key 的副本。
+pub(crate) type IndexPtrOrdArr<const M: usize, K, V> =
     OrderedArray<M, SlotPtr<(K, V)>, TreeNodePtr<M, K, V>>;
 
-/// Type-safe handle to a tree node stored in a `SlabList`.
-pub type TreeNodePtr<const M: usize, K, V = ()> = SlotPtr<TreeNode<M, K, V>>;
+/// 指向 `SlabList` 中树节点的类型安全句柄。
+pub(crate) type TreeNodePtr<const M: usize, K, V = ()> = SlotPtr<TreeNode<M, K, V>>;
 
+/// B+ Tree 节点。
 #[derive(Debug)]
-pub enum TreeNode<const M: usize, K, V> {
-    Root(RootNode<M, K, V>),
+pub(crate) enum TreeNode<const M: usize, K, V> {
+    /// 索引节点：保存 `(子树最大 key 的引用, 孩子指针)`。
     Index(IndexNode<M, K, V>),
+
+    /// 叶子节点：保存实际数据的引用，并通过 `prev` / `next` 组成叶子链。
     Leaf(DataLeaf<M, K, V>),
 }
 
+/// 索引节点。
 #[derive(Debug)]
-pub struct RootNode<const M: usize, K, V> {
+pub(crate) struct IndexNode<const M: usize, K, V> {
+    /// 按子树最大 key 排序的 `(separator, child)` 数组。
     pub(crate) children_: IndexPtrOrdArr<M, K, V>,
-    pub(crate) sentinel_: Option<LeafSentinel<M, K, V>>,
 }
 
-///
+/// 叶子节点。
 #[derive(Debug)]
-pub struct IndexNode<const M: usize, K, V> {
-    pub(crate) children_: IndexPtrOrdArr<M, K, V>,
-    pub(crate) parent_: TreeNodePtr<M, K, V>,
-}
-
-#[derive(Debug)]
-pub struct DataLeaf<const M: usize, K, V> {
+pub(crate) struct DataLeaf<const M: usize, K, V> {
+    /// 按数据 key 排序的数据引用数组。
     pub(crate) order_arr_: DataPtrOrdArr<M, K, V>,
-    pub(crate) prev_sibl_: TreeNodePtr<M, K, V>,
-    pub(crate) next_sibl_: TreeNodePtr<M, K, V>,
+
+    /// 前一个叶子；首叶为 `None`。
+    pub(crate) prev_sibl_: Option<TreeNodePtr<M, K, V>>,
+
+    /// 后一个叶子；尾叶为 `None`。
+    pub(crate) next_sibl_: Option<TreeNodePtr<M, K, V>>,
 }
 
-#[derive(Debug)]
-pub struct LeafSentinel<const M: usize, K, V> {
-    pub(crate) head_: TreeNodePtr<M, K, V>,
-    pub(crate) tail_: TreeNodePtr<M, K, V>,
+impl<const M: usize, K, V> IndexNode<M, K, V> {
+    /// 创建一个空索引节点。
+    pub(crate) const fn new_() -> Self {
+        IndexNode {
+            children_: OrderedArray::new(),
+        }
+    }
+
+    /// 返回索引项数量，也就是孩子数量。
+    pub(crate) const fn len_(&self) -> usize {
+        self.children_.len()
+    }
 }
 
-fn select_key<'f, K, V>(t: (&'f K, &'f V)) -> &'f K {
-    t.0
+impl<const M: usize, K, V> DataLeaf<M, K, V> {
+    /// 创建一个空叶子节点。
+    pub(crate) const fn new_() -> Self {
+        DataLeaf {
+            order_arr_: OrderedArray::new(),
+            prev_sibl_: Option::None,
+            next_sibl_: Option::None,
+        }
+    }
+
+    /// 返回叶子中的元素数量。
+    pub(crate) const fn len_(&self) -> usize {
+        self.order_arr_.len()
+    }
 }
 
 impl<const M: usize, K, V> TreeNode<M, K, V> {
-    pub fn first_key(&self) -> Option<&SlotPtr<(K, V)>> {
+    /// 返回节点中的项数：叶子为数据项数，索引为孩子数。
+    pub(crate) fn len_(&self) -> usize {
         match self {
-            TreeNode::Leaf(leaf) => leaf.order_arr_.first().map(select_key),
-            TreeNode::Index(index) => index.children_.first().map(select_key),
-            TreeNode::Root(root) => root.children_.first().map(select_key),
+            TreeNode::Index(index) => index.len_(),
+            TreeNode::Leaf(leaf) => leaf.len_(),
         }
     }
 
-    pub fn last_key(&self) -> Option<&SlotPtr<(K, V)>> {
+    /// 返回节点是否叶子。
+    pub(crate) fn is_leaf_(&self) -> bool {
+        matches!(self, TreeNode::Leaf(_))
+    }
+
+    /// 以索引节点引用访问；叶子返回 `None`。
+    pub(crate) fn as_index_(&self) -> Option<&IndexNode<M, K, V>> {
         match self {
-            TreeNode::Leaf(leaf) => leaf.order_arr_.last().map(select_key),
-            TreeNode::Index(index) => index.children_.last().map(select_key),
-            TreeNode::Root(root) => root.children_.last().map(select_key),
-        }
-    }
-}
-
-pub trait TrPickKeyPolicy<const M: usize, K, V> {
-    fn pick<'f>(node: &'f TreeNode<M, K, V>) -> &'f K;
-}
-
-pub struct PickLastKey<const M: usize, K, V>(PhantomData<fn() -> (K, V)>);
-pub struct PickFirstKey<const M: usize, K, V>(PhantomData<fn() -> (K, V)>);
-
-impl<const M: usize, K, V> TrPickKeyPolicy<M, K, V> for PickLastKey<M, K, V> {
-    fn pick<'f>(node: &'f TreeNode<M, K, V>) -> &'f K {
-        let Option::Some(k) = node.last_key() else {
-            unreachable!("empty node encountered")
-        };
-        let (k, _) = &**k;
-        k
-    }
-}
-
-impl<const M: usize, K, V> TrPickKeyPolicy<M, K, V> for PickFirstKey<M, K, V> {
-    fn pick<'f>(node: &'f TreeNode<M, K, V>) -> &'f K {
-        let Option::Some(k) = node.first_key() else {
-            unreachable!("empty node encountered")
-        };
-        let (k, _) = &**k;
-        k
-    }
-}
-
-pub struct IndexKeyComparer<'a, const M: usize, P, C, K, V>
-where
-    P: TrPickKeyPolicy<M, K, V>,
-    C: TrComparer<K>,
-{
-    k_cmp_: &'a C,
-    _mark_: PhantomData<fn() -> (P, K, V)>,
-}
-
-impl<'a, const M: usize, P, C, K, V> IndexKeyComparer<'a, M, P, C, K, V>
-where
-    P: TrPickKeyPolicy<M, K, V>,
-    C: TrComparer<K>,
-{
-    const fn new(key_cmp: &'a C) -> Self {
-        IndexKeyComparer {
-            k_cmp_: key_cmp,
-            _mark_: PhantomData,
+            TreeNode::Index(index) => Option::Some(index),
+            TreeNode::Leaf(_) => Option::None,
         }
     }
 
-    pub fn compare(&self, lhs: &(K, V), rhs: &TreeNode<M, K, V>) -> cmp::Ordering {
-        let (l_key, _) = lhs;
-        let r_key = <P as TrPickKeyPolicy<M, K, V>>::pick(rhs);
-        self.k_cmp_.compare(l_key, r_key)
-    }
-}
-
-impl<'a, const M: usize, C, K, V> IndexKeyComparer<'a, M, PickFirstKey<M, K, V>, C, K, V>
-where
-    C: TrComparer<K>,
-    K: Ord,
-{
-    pub const fn pick_first_key(key_cmp: &'a C) -> Self {
-        Self::new(key_cmp)
-    }
-}
-
-impl<'a, const M: usize, C, K, V> IndexKeyComparer<'a, M, PickLastKey<M, K, V>, C, K, V>
-where
-    C: TrComparer<K>,
-    K: Ord,
-{
-    pub const fn pick_last_key(key_cmp: &'a C) -> Self {
-        Self::new(key_cmp)
-    }
-}
-
-impl<const M: usize, P, C, K, V> TrComparer<(K, V), TreeNode<M, K, V>>
-    for IndexKeyComparer<'_, M, P, C, K, V>
-where
-    P: TrPickKeyPolicy<M, K, V>,
-    C: TrComparer<K>,
-{
-    #[inline]
-    fn compare(&self, a: &(K, V), b: &TreeNode<M, K, V>) -> cmp::Ordering {
-        IndexKeyComparer::compare(self, a, b)
-    }
-}
-
-pub struct IndexOrdKeyComparer<const M: usize, P, K, V>
-where
-    P: TrPickKeyPolicy<M, K, V>,
-    K: Ord,
-{
-    _mark_: PhantomData<fn() -> (P, K, V)>,
-}
-
-impl<const M: usize, P, K, V> IndexOrdKeyComparer<M, P, K, V>
-where
-    P: TrPickKeyPolicy<M, K, V>,
-    K: Ord,
-{
-    const fn new() -> Self {
-        IndexOrdKeyComparer {
-            _mark_: PhantomData,
+    /// 以可变索引节点引用访问；叶子返回 `None`。
+    pub(crate) fn as_index_mut_(&mut self) -> Option<&mut IndexNode<M, K, V>> {
+        match self {
+            TreeNode::Index(index) => Option::Some(index),
+            TreeNode::Leaf(_) => Option::None,
         }
     }
 
-    pub fn compare(&self, lhs: &(K, V), rhs: &TreeNode<M, K, V>) -> cmp::Ordering {
-        let (l_key, _) = lhs;
-        let r_key = <P as TrPickKeyPolicy<M, K, V>>::pick(rhs);
-        <K as Ord>::cmp(l_key, r_key)
+    /// 以叶子引用访问；索引返回 `None`。
+    pub(crate) fn as_leaf_(&self) -> Option<&DataLeaf<M, K, V>> {
+        match self {
+            TreeNode::Leaf(leaf) => Option::Some(leaf),
+            TreeNode::Index(_) => Option::None,
+        }
     }
-}
 
-impl<const M: usize, K, V> IndexOrdKeyComparer<M, PickFirstKey<M, K, V>, K, V>
-where
-    K: Ord,
-{
-    pub const fn pick_first_key() -> Self {
-        Self::new()
+    /// 以可变叶子引用访问；索引返回 `None`。
+    pub(crate) fn as_leaf_mut_(&mut self) -> Option<&mut DataLeaf<M, K, V>> {
+        match self {
+            TreeNode::Leaf(leaf) => Option::Some(leaf),
+            TreeNode::Index(_) => Option::None,
+        }
     }
-}
 
-impl<const M: usize, K, V> IndexOrdKeyComparer<M, PickLastKey<M, K, V>, K, V>
-where
-    K: Ord,
-{
-    pub const fn pick_last_key() -> Self {
-        Self::new()
+    /// 返回节点中逻辑上最后一个数据 key 的句柄。
+    pub(crate) fn last_key_(&self) -> Option<&SlotPtr<(K, V)>> {
+        match self {
+            TreeNode::Index(index) => index.children_.last().map(|(key, _)| key),
+            TreeNode::Leaf(leaf) => leaf.order_arr_.last().map(|(key, _)| key),
+        }
     }
-}
 
-impl<const M: usize, P, K, V> TrComparer<(K, V), TreeNode<M, K, V>>
-    for IndexOrdKeyComparer<M, P, K, V>
-where
-    P: TrPickKeyPolicy<M, K, V>,
-    K: Ord,
-{
-    #[inline]
-    fn compare(&self, a: &(K, V), b: &TreeNode<M, K, V>) -> cmp::Ordering {
-        IndexOrdKeyComparer::compare(self, a, b)
+    /// 返回节点最大数据 key 的句柄副本。
+    pub(crate) fn max_key_(&self) -> Option<SlotPtr<(K, V)>> {
+        self.last_key_().copied()
     }
 }

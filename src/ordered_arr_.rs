@@ -12,11 +12,33 @@ use crate::comparer_::{OrdComparer, TrComparer};
 #[derive(Debug)]
 pub struct ConflictInfo<'a, K, V = ()> {
     /// The index of the existing item
-    at: usize,
+    at_: usize,
     /// The mut ref to the existing item in the array
-    existing: (&'a K, &'a mut V),
+    existing_: (&'a K, &'a mut V),
     /// The conflicting value that failed to insert.
-    conflict: ConflictItem<'a, K, V>,
+    conflict_: ConflictItem<'a, K, V>,
+}
+
+impl<'a, K, V> ConflictInfo<'a, K, V> {
+    /// 返回冲突项在有序数组中的逻辑下标。
+    pub const fn at(&self) -> usize {
+        self.at_
+    }
+
+    /// 返回数组中已存在元素的 key 与 value 引用。
+    pub fn existing(&self) -> (&K, &V) {
+        (self.existing_.0, &*self.existing_.1)
+    }
+
+    /// 返回未能插入的元素。
+    pub const fn conflict(&self) -> &ConflictItem<'a, K, V> {
+        &self.conflict_
+    }
+
+    /// 拆分为已存在元素与冲突元素。
+    pub fn into_parts(self) -> ((&'a K, &'a mut V), ConflictItem<'a, K, V>) {
+        (self.existing_, self.conflict_)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -176,8 +198,8 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
         // 0. 获得物理写入位置的索引
         let new_phys_idx = self.order_[self.count_];
         if self.count_ == 0 {
-            for i in 0..N {
-                self.order_[i] = i
+            for (i, slot) in self.order_.iter_mut().enumerate() {
+                *slot = i;
             }
             self.elems_[0].write(pair);
             self.count_ += 1;
@@ -192,9 +214,9 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
 
                 if cmp.compare(k, hint) == Ordering::Equal {
                     return TryInsertResult::Conflict(ConflictInfo {
-                        at: pos,
-                        existing: (k as &_, v),
-                        conflict: ConflictItem::Pair(pair),
+                        at_: pos,
+                        existing_: (k as &_, v),
+                        conflict_: ConflictItem::Pair(pair),
                     });
                 }
             }
@@ -241,8 +263,8 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
         // 0. 获得物理写入位置的索引
         let new_phys_idx = self.order_[self.count_];
         if self.count_ == 0 {
-            for i in 0..N {
-                self.order_[i] = i
+            for (i, slot) in self.order_.iter_mut().enumerate() {
+                *slot = i;
             }
             let kv = factory(hint);
             self.elems_[0].write(kv);
@@ -258,9 +280,9 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
 
                 if cmp.compare(k, hint) == Ordering::Equal {
                     return TryInsertResult::Conflict(ConflictInfo {
-                        at: pos,
-                        existing: (k as &_, v),
-                        conflict: ConflictItem::Key(hint),
+                        at_: pos,
+                        existing_: (k as &_, v),
+                        conflict_: ConflictItem::Key(hint),
                     });
                 }
             }
@@ -277,7 +299,7 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
         TryInsertResult::Succ((k as &_, v))
     }
 
-    /// 移除最后一个元素，也是唯一有效的移除方式。
+    /// 移除最后一个元素。
     /// 这个方法不会影响下一次插入，
     /// 因为移除后会在最后一个索引位置记录被移除元素的物理索引。
     pub fn try_remove_last(&mut self) -> Option<(K, V)> {
@@ -290,10 +312,56 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
         Option::Some(unsafe { x.assume_init_read() })
     }
 
+    /// 移除逻辑顺序中下标为 `i` 的元素。
+    ///
+    /// 返回被移除的 `(K, V)`；若 `i >= len()` 则返回 `None`。
+    /// 移除后剩余元素保持原有逻辑顺序，被释放的物理槽位会记录在空闲区，
+    /// 后续插入可以复用。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bplustree_cmp::OrderedArray;
+    ///
+    /// let mut arr = OrderedArray::<4, i32>::default();
+    /// arr.try_insert_ord(3);
+    /// arr.try_insert_ord(1);
+    /// arr.try_insert_ord(2);
+    ///
+    /// let removed = arr.try_remove_at(1);
+    /// assert_eq!(removed, Some((2, ())));
+    /// assert_eq!(arr.len(), 2);
+    /// ```
+    pub fn try_remove_at(&mut self, i: usize) -> Option<(K, V)> {
+        if i >= self.count_ {
+            return Option::None;
+        }
+
+        let phys_idx = self.order_[i];
+
+        // 逻辑顺序左移；被删元素的物理槽位最后记录到空闲区起点。
+        for j in i..self.count_ - 1 {
+            self.order_[j] = self.order_[j + 1];
+        }
+        self.count_ -= 1;
+        self.order_[self.count_] = phys_idx;
+
+        // SAFETY: phys_idx 来自 order_[i]，且 i < 旧 count_，因此该物理槽位
+        // 在本函数返回前一直是已初始化元素。读出后该槽位不再属于存活区间。
+        Option::Some(unsafe { self.elems_[phys_idx].assume_init_read() })
+    }
+
+    /// 移除逻辑顺序中的第一个元素。
+    ///
+    /// 返回被移除的 `(K, V)`；空数组返回 `None`。
+    pub fn try_remove_first(&mut self) -> Option<(K, V)> {
+        self.try_remove_at(0)
+    }
+
     /// 查找 comparer 意义下等价的元素。
     ///
     /// 找到时返回元素引用，否则返回 `None`。
-    pub fn find_by<'f, TyHint, TyCmp>(
+    pub fn find_by<'f, TyHint: ?Sized, TyCmp>(
         &'f self,
         hint: &'f TyHint,
         cmp: &TyCmp,
@@ -312,7 +380,7 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
     ///
     /// 找到 comparer 意义下等价的元素时返回 `Ok(index)`；
     /// 否则返回 `Err(index)`，其中 `index` 是该元素应该插入的位置。
-    pub fn binary_search_by<TyHint, TyCmp>(
+    pub fn binary_search_by<TyHint: ?Sized, TyCmp>(
         &self,
         hint: &TyHint,
         cmp: &TyCmp,
@@ -334,7 +402,7 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
     }
 
     /// 寻找第一个满足 elem >= query 的位置
-    pub fn lower_bound_by<Q, C>(&self, query: &Q, cmp: &C) -> usize
+    pub fn lower_bound_by<Q: ?Sized, C>(&self, query: &Q, cmp: &C) -> usize
     where
         C: TrComparer<K, Q>,
     {
@@ -344,7 +412,7 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
     }
 
     /// 寻找第一个满足 elem > query 的位置
-    pub fn upper_bound_by<Q, C>(&self, query: &Q, cmp: &C) -> usize
+    pub fn upper_bound_by<Q: ?Sized, C>(&self, query: &Q, cmp: &C) -> usize
     where
         C: TrComparer<K, Q>,
     {
@@ -354,7 +422,7 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
     }
 
     /// 返回 [0, count_) 中第一个使 pred 返回 false 的位置。
-    fn partition_point_<Q, P>(&self, query: &Q, mut pred: P) -> usize
+    fn partition_point_<Q: ?Sized, P>(&self, query: &Q, mut pred: P) -> usize
     where
         P: FnMut(&K, &Q) -> bool,
     {
@@ -470,25 +538,6 @@ impl<'a, const N: usize, K, V> Iterator for Iter<'a, N, K, V> {
 //-----------------------------------------------------------------------------
 
 #[cfg(test)]
-pub(crate) fn from_test_items_by_<const M: usize, C, K, V>(
-    items: impl core::iter::IntoIterator<Item = (K, V)>,
-    cmp: &C,
-) -> OrderedArray<M, K, V>
-where
-    K: Clone,
-    C: TrComparer<K>,
-{
-    let mut it = items.into_iter();
-    let mut arr = OrderedArray::<M, K, V>::new();
-    while let Option::Some(t) = it.next() {
-        let (k, v) = t;
-        let x = arr.try_insert_by(&k, cmp, |_| (k.clone(), v));
-        assert!(x.is_full());
-    }
-    arr
-}
-
-#[cfg(test)]
 mod tests {
     use std::{
         string::{String, ToString},
@@ -512,10 +561,10 @@ mod tests {
         let TryInsertResult::Conflict(x) = conflict else {
             unreachable!()
         };
-        assert_eq!(x.at, 0usize);
-        let (k, _) = x.existing;
+        assert_eq!(x.at(), 0usize);
+        let (k, _) = x.existing();
         assert_eq!(*k, 1);
-        assert_eq!(x.conflict, ConflictItem::Pair((1, ())));
+        assert_eq!(*x.conflict(), ConflictItem::Pair((1, ())));
 
         let expected = [1, 2, 3, 4];
         for (u, (i, _)) in arr.iter().enumerate() {
@@ -550,6 +599,10 @@ mod tests {
 
     fn select_key<'f, K, V>(t: (&'f K, &'f V)) -> &'f K {
         t.0
+    }
+
+    fn collect_keys_<const N: usize>(arr: &OrderedArray<N, i32>) -> Vec<i32> {
+        arr.iter().map(select_key).copied().collect()
     }
 
     #[test]
@@ -608,6 +661,90 @@ mod tests {
 
         // 确保之前删除的 5 和 4 的位置被正确覆盖，没有残留数据
         // 通过有序性和长度验证即可
+    }
+
+    /// 测试目标：验证 `try_remove_at` 能删除任意逻辑位置并保持剩余顺序。
+    /// Test goal: Verify that `try_remove_at` removes an arbitrary logical index
+    /// while preserving the order of the remaining elements.
+    ///
+    /// 测试手段：插入 5 个元素后依次删除中间、开头和末尾元素，再插入一个新元素。
+    /// Test method: Insert five elements, remove the middle, first, and last ones in
+    /// turn, then insert another element.
+    ///
+    /// 判定标准：每次删除返回正确的 `(K, V)`，剩余元素顺序正确，且重新插入后
+    /// 仍保持整体有序。
+    /// Assertions: Each removal returns the expected `(K, V)`, the remaining order is
+    /// correct, and a later insert keeps the array sorted.
+    #[test]
+    fn test_remove_at_preserves_order() {
+        let mut arr = OrderedArray::<8, i32>::default();
+        for x in [10, 20, 30, 40, 50] {
+            assert!(arr.try_insert_ord(x).is_succ());
+        }
+
+        assert_eq!(arr.try_remove_at(2), Some((30, ())));
+        assert_eq!(collect_keys_(&arr), vec![10, 20, 40, 50]);
+
+        assert_eq!(arr.try_remove_at(0), Some((10, ())));
+        assert_eq!(collect_keys_(&arr), vec![20, 40, 50]);
+
+        assert_eq!(arr.try_remove_at(arr.len() - 1), Some((50, ())));
+        assert_eq!(collect_keys_(&arr), vec![20, 40]);
+
+        assert!(arr.try_insert_ord(25).is_succ());
+        assert_eq!(collect_keys_(&arr), vec![20, 25, 40]);
+    }
+
+    /// 测试目标：验证 `try_remove_at` 对越界下标返回 `None` 且不改变数组。
+    /// Test goal: Verify that `try_remove_at` returns `None` for an out-of-bounds
+    /// index and leaves the array unchanged.
+    ///
+    /// 测试手段：分别在空数组和非空数组上调用越界下标。
+    /// Test method: Call the method with an out-of-bounds index on an empty array and
+    /// on a non-empty array.
+    ///
+    /// 判定标准：两次都返回 `None`，非空数组的长度和内容保持不变。
+    /// Assertions: Both calls return `None`, and the non-empty array keeps its length
+    /// and contents.
+    #[test]
+    fn test_remove_at_out_of_bounds() {
+        let mut empty = OrderedArray::<4, i32>::default();
+        assert_eq!(empty.try_remove_at(0), None);
+        assert_eq!(empty.try_remove_first(), None);
+
+        let mut arr = OrderedArray::<4, i32>::default();
+        assert!(arr.try_insert_ord(1).is_succ());
+        assert_eq!(arr.try_remove_at(1), None);
+        assert_eq!(collect_keys_(&arr), vec![1]);
+    }
+
+    /// 测试目标：验证数组被删空后仍可正常插入，并复用释放的物理槽位。
+    /// Test goal: Verify that an array emptied by `try_remove_at` can be inserted
+    /// into again and reuses the released physical slots.
+    ///
+    /// 测试手段：插入三个元素后逐个删除到空，再插入一个新元素。
+    /// Test method: Insert three elements, remove all of them one by one, then insert
+    /// a new element.
+    ///
+    /// 判定标准：删除过程中长度正确递减；删空后长度为 0；重新插入后长度为 1，
+    /// 元素值正确且顺序正确。
+    /// Assertions: The length decreases correctly during removal, reaches zero when
+    /// empty, and becomes one with the expected value after reinsertion.
+    #[test]
+    fn test_remove_all_then_insert() {
+        let mut arr = OrderedArray::<4, String>::default();
+        assert!(arr.try_insert_ord("b".to_string()).is_succ());
+        assert!(arr.try_insert_ord("a".to_string()).is_succ());
+        assert!(arr.try_insert_ord("c".to_string()).is_succ());
+
+        assert_eq!(arr.try_remove_first(), Some(("a".to_string(), ())));
+        assert_eq!(arr.try_remove_at(0), Some(("b".to_string(), ())));
+        assert_eq!(arr.try_remove_at(0), Some(("c".to_string(), ())));
+        assert_eq!(arr.len(), 0);
+
+        assert!(arr.try_insert_ord("z".to_string()).is_succ());
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr.get_ref_at(0).map(|(k, _)| k.as_str()), Ok("z"));
     }
 }
 

@@ -135,7 +135,7 @@ Index 保存数据引用和树结构，而不是复制数据：数据是 `(K, V)
 
 # OrderedArray
 
-B+ Tree 的 Root、Index 和 Leaf 节点内部都需要维护容量固定的小型有序数组。BPlusTreeCmp 提供 `OrderedArray<const M: usize, K, V = ()>`，将物理存储与逻辑排序分离。其中 Key 与 Value 是独立的，类型为 `OrderedArray<M, K, V>`，并通过 `TrComparer<K, Query>` 执行搜索和定序。
+B+ Tree 的 Index 和 Leaf 节点内部都需要维护容量固定的小型有序数组。BPlusTreeCmp 提供 `OrderedArray<const M: usize, K, V = ()>`，将物理存储与逻辑排序分离。其中 Key 与 Value 是独立的，类型为 `OrderedArray<M, K, V>`，并通过 `TrComparer<K, Query>` 执行搜索和定序。
 
 因此同一个 `OrderedArray` 可以支持 `K ↔ K`、`K ↔ &str`、`K ↔ u64`、`K ↔ Query`，只要存在相应的 Comparer。
 
@@ -146,8 +146,7 @@ B+ Tree 的 Root、Index 和 Leaf 节点内部都需要维护容量固定的小�
 当前树节点抽象为：
 
 ```rust
-pub enum TreeNode<const M: usize, K, V> {
-    Root(RootNode<M, K, V>),
+pub(crate) enum TreeNode<const M: usize, K, V> {
     Index(IndexNode<M, K, V>),
     Leaf(DataLeaf<M, K, V>),
 }
@@ -155,23 +154,33 @@ pub enum TreeNode<const M: usize, K, V> {
 
 其中 `TreeNodePtr<M, K, V>` 是 `SlotPtr<TreeNode<M, K, V>>` 的类型别名。
 
-### Root
+root 可以是 `Index`，也可以是 `Leaf`。root 指针、首叶和尾叶由 `BPlusTree` 自己持有：
 
-Root 保存子节点引用。
+```rust
+root_: Option<TreeNodePtr<M, K, V>>,
+first_leaf_: Option<TreeNodePtr<M, K, V>>,
+last_leaf_: Option<TreeNodePtr<M, K, V>>,
+```
+
+这样不需要单独的 `RootNode` 变体，也不需要让节点保存父指针；插入和删除使用显式 path 栈。
 
 ### Index
 
-Index 保存 `OrderedArray<M, SlotPtr<(K, V)>, TreeNodePtr<M, K, V>>`。也就是说，`Key` 先经 `SlotPtr<(K, V)>` 指向实际数据，而 Value 是 `TreeNodePtr`。因此 IndexNode 中的“排序 Key”实际上是一个数据引用，**这里没有复制 Key**。
+Index 保存 `OrderedArray<M, SlotPtr<(K, V)>, TreeNodePtr<M, K, V>>`。也就是说，`Key` 先经 `SlotPtr<(K, V)>` 指向实际数据，而 Value 是 `TreeNodePtr`。每个索引项的分隔 key 是**孩子子树中最大 key 的引用**，因此 IndexNode 中的“排序 Key”实际上是一个数据引用，**这里没有复制 Key**。
 
 ### Leaf
 
-Leaf 保存 `OrderedArray<M, SlotPtr<(K, V)>, ()>`，同样通过 SlotPtr 指向真正的数据。`Data`、`Index`、`Tree Structure` 因此可以保持相对独立。
+Leaf 保存 `OrderedArray<M, SlotPtr<(K, V)>, ()>`，同样通过 SlotPtr 指向真正的数据。叶子通过 `Option<TreeNodePtr>` 类型的 `prev` / `next` 组成双向链，首叶没有前驱，尾叶没有后继。`Data`、`Index`、`Tree Structure` 因此可以保持相对独立。
 
 ---
 
 # 为什么这种设计仍然是 B+ Tree？
 
 B+ Tree 的核心不是“每个 IndexNode 必须保存一组 Key 的副本”，而是“将有序数据空间划分为连续区间，并根据查询确定应该进入哪个子树”。Separator Key 只是表达区间划分的一种方式；BPlusTreeCmp 通过 `数据引用 + Comparer` 表达相同信息：传统实现用 `Separator Key` 决定子树，而这里用 `SlotPtr<(K,V)>` 找到实际数据，再由 `Comparer` 决定子树。
+
+搜索时在索引节点取第一个 `separator >= query` 的孩子；如果所有 separator 都小于 query，则走最后一个孩子。查询落在两个子树之间的空档时进入后一个孩子，插入到该孩子头部仍然正确。
+
+由于 separator 是数据引用，删除某个子树的最大 key 时必须沿搜索路径把祖先中指向它的 separator 替换为新的最大 key，并且要等所有 separator 更新完成后才能从 Data SlabList 删除该元素。这是“不复制 Key”的直接代价，也是插入/删除使用 path 栈的原因。
 
 两者表达同一个排序关系，区别在于后者不会在 IndexNode 中复制 Key。
 
@@ -226,6 +235,43 @@ Comparer 不仅可以比较实际数据 `K ↔ K`，也可以通过 SlotPtr 适�
 BPlusTreeCmp 的查询模型不是 `tree.get(key)`，而更接近 `tree.get_by(&query, &comparer)`：查询对象 `Query` 通过 `Comparer<K, Q>` 与树中的 `K` 建立关系，因此同一个数据集合可以存在多个查询关系。
 
 例如同一个 `User` 可以分别通过 `IdComparer`、`NameComparer`、`EmailComparer`、`BirthdayComparer` 建立查询关系；甚至可以直接通过 `User ↔ u64` 的 Comparer 查询，不需要改变 `User`，也不需要创建临时 `User`。
+
+---
+
+# 操作 API
+
+```rust
+use bplustree_cmp::{BPlusTree, OrdComparer};
+
+let mut tree = BPlusTree::<4, _, u64, &str>::new_in(OrdComparer::new()).unwrap();
+
+// 插入；重复 key 返回 ConflictInfo
+let _ = tree.try_insert(1, "one"); // Err(ConflictInfo) 表示已存在
+
+// 覆盖已有 value，返回旧 value
+let old = tree.insert(1, "uno");
+
+// 同构查询与异构查询
+let pair = tree.get(1);
+let pair = tree.get_by(&1u64, &OrdComparer::new());
+
+// 按序迭代
+for (key, value) in &tree {
+    println!("{key}: {value}");
+}
+
+// 删除：remove 返回 value，remove_entry 返回 (K, V)
+let value = tree.remove(1);
+let entry = tree.remove_entry(2);
+
+// 从已有集合构建
+let tree = BPlusTree::<4, _, u64, &str>::from_iter_by(
+    OrdComparer::new(),
+    vec![(2, "two"), (1, "one")],
+).unwrap();
+```
+
+`try_insert_by` / `get_by` / `remove_by` 接受一个异构 Comparer，因此查询对象可以是 `&str`、`u64` 等与 `K` 不同的类型。`factory` 只在确认没有等价 key 后调用一次，避免为一次失败的插入构造临时 `K`。
 
 ---
 
@@ -294,28 +340,32 @@ Comparer 负责：
 
 # 当前状态
 
-项目当前主要目标是实现和验证这种 **Comparer-first B+ Tree** 架构。
-
-目前已经建立的核心基础包括：
+当前已经完成：
 
 * `TrComparer<A, B>` 排序抽象
 * 同构与异构 Comparer
 * typed `SlotPtr<T>` 句柄
 * SlabList 抽象
-* Root / Index / Leaf 节点模型
+* Index / Leaf 节点模型
 * `OrderedArray<M, K, V>`
 * 基于 Comparer 的有序数组搜索
-* `(K, V)` 数据模型
-* Index 中通过 `SlotPtr<(K,V)>` 引用数据
-* 面向异构查询的 API 设计
+* 插入、节点分裂、根分裂
+* 删除、借位、合并、根收缩
+* 叶子链与按序迭代
+* `first` / `last` / `get` / `get_mut` / `get_by` / `get_mut_by`
+* `try_insert` / `try_insert_by` / `insert`
+* `remove` / `remove_entry` / `remove_by` / `remove_entry_by`
+* `from_iter_by` / `FromIterator` / `Extend`
+* 异构查询，包括 `String` 与 `str`、`User` 与 `u64` 这类类型组合
+* 随机操作与结构不变量测试
 
-完整的 B+ Tree 插入、节点分裂、删除、搜索以及更高层 API 仍在持续实现中。
+节点容量 `M` 是每个节点的最大项数，要求 `M >= 2`。非根节点的最小占用为 `M / 2`（向下取整）；偶数 `M` 会得到对称分裂，奇数 `M` 仍然正确，只是填充率略不对称。
 
-因此当前项目更适合作为：
+因此当前项目可以作为：
 
-> **一种 Comparer-first、轻量索引、数据与排序关系解耦的 B+ Tree 架构实现。**
+> **一种 Comparer-first、轻量索引、数据与排序关系解耦的 B+ Tree 实现。**
 
-而不是已经完成的标准库 `BTreeMap` 替代品。
+它仍然不是标准库 `BTreeMap` 的完全替代品：目前 allocator / SlabList 配置尚未暴露为 `BPlusTree` 的泛型参数，也尚未提供 `Entry` API、范围查询和 owned iterator 等更高层功能。
 
 ---
 

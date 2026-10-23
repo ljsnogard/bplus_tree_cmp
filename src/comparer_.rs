@@ -2,7 +2,7 @@ use core::{cmp::Ordering, marker::PhantomData};
 
 use crate::slab_list_::SlotPtr;
 
-/// Comparer used by [`BPlusTree`].
+/// Comparer used by [`crate::BPlusTree`].
 ///
 /// The map does not impose any trait bound on `K`. The comparer is the complete
 /// definition of key ordering.
@@ -52,98 +52,78 @@ where
     }
 }
 
-pub struct PairAdaptComparer<'a, T, C>
-where
-    C: TrComparer<T>,
-{
-    t_cmp_: &'a C,
-    _t_: PhantomData<fn(&'a T) -> Ordering>,
-}
-
-impl<'a, T, C> PairAdaptComparer<'a, T, C>
-where
-    C: TrComparer<T>,
-{
-    pub const fn new(cmp: &'a C) -> Self {
-        PairAdaptComparer {
-            t_cmp_: cmp,
-            _t_: PhantomData,
-        }
-    }
-}
-
-impl<'a, T, C> TrComparer<(T, ())> for PairAdaptComparer<'a, T, C>
-where
-    C: TrComparer<T>,
-{
-    #[inline]
-    fn compare(&self, a: &(T, ()), b: &(T, ())) -> Ordering {
-        self.t_cmp_.compare(&a.0, &b.0)
-    }
-}
-
-/// 同构定序：比较两个指向同类型元素的 [`SlotPtr`]。
+/// 比较两个指向 `(K, V)` 的 [`SlotPtr`]，只使用其中的 `K` 参与比较。
 ///
-/// `SlotPtr` 直接指向元素，因此不需要再持有额外的容器引用。
-pub struct HomoSlotComparer<'a, T, C>
+/// B+ 树的节点数组以 `SlotPtr<(K, V)>` 作为排序键，而用户提供的
+/// `C: TrComparer<K>` 只定义 `K` 的比较关系；该适配器负责把二者连接起来。
+pub(crate) struct SlotPairKeyComparer<'a, K, V, C>
 where
-    C: TrComparer<T>,
+    C: TrComparer<K>,
 {
     comparer_: &'a C,
-    _marker_: PhantomData<fn(&'a T) -> Ordering>,
+    _mark_: PhantomData<fn() -> (K, V)>,
 }
 
-impl<'a, T, C> HomoSlotComparer<'a, T, C>
+impl<'a, K, V, C> SlotPairKeyComparer<'a, K, V, C>
 where
-    C: TrComparer<T>,
+    C: TrComparer<K>,
 {
-    pub const fn new(comparer: &'a C) -> Self {
-        HomoSlotComparer {
+    pub(crate) const fn new_(comparer: &'a C) -> Self {
+        SlotPairKeyComparer {
             comparer_: comparer,
-            _marker_: PhantomData,
+            _mark_: PhantomData,
         }
     }
 }
 
-impl<'a, T, C> TrComparer<SlotPtr<T>> for HomoSlotComparer<'a, T, C>
+impl<K, V, C> TrComparer<SlotPtr<(K, V)>> for SlotPairKeyComparer<'_, K, V, C>
 where
-    C: TrComparer<T>,
+    C: TrComparer<K>,
 {
     #[inline]
-    fn compare(&self, a: &SlotPtr<T>, b: &SlotPtr<T>) -> Ordering {
-        self.comparer_.compare(&**a, &**b)
+    fn compare(&self, a: &SlotPtr<(K, V)>, b: &SlotPtr<(K, V)>) -> Ordering {
+        let (a_key, _) = &**a;
+        let (b_key, _) = &**b;
+        self.comparer_.compare(a_key, b_key)
     }
 }
 
-/// 异构定序：比较两个指向不同类型元素的 [`SlotPtr`]。
+/// 把指向 `(K, V)` 的 [`SlotPtr`] 与异构查询对象 `Q` 比较。
 ///
-/// `SlotPtr` 直接指向元素，因此不需要再持有额外的容器引用。
-pub struct HeteroSlotComparer<'a, L, R, C>
+/// 该适配器让节点数组可以直接用 `TrComparer<K, Q>` 搜索：数组元素是
+/// `SlotPtr<(K, V)>`，比较时先解引用到实际数据，再只取其中的 `K`。
+pub(crate) struct QuerySlotComparer<'a, K, V, Q, C>
 where
-    C: TrComparer<L, R>,
+    Q: ?Sized,
+    C: TrComparer<K, Q>,
 {
     comparer_: &'a C,
-    _marker_: PhantomData<fn(&'a L, &'a R) -> Ordering>,
+    _mark_: PhantomData<fn() -> (K, V)>,
+    _query_: PhantomData<*const Q>,
 }
 
-impl<'a, L, R, C> HeteroSlotComparer<'a, L, R, C>
+impl<'a, K, V, Q, C> QuerySlotComparer<'a, K, V, Q, C>
 where
-    C: TrComparer<L, R>,
+    Q: ?Sized,
+    C: TrComparer<K, Q>,
 {
-    pub const fn new(comparer: &'a C) -> Self {
-        HeteroSlotComparer {
+    pub(crate) const fn new_(comparer: &'a C) -> Self {
+        QuerySlotComparer {
             comparer_: comparer,
-            _marker_: PhantomData,
+            _mark_: PhantomData,
+            _query_: PhantomData,
         }
     }
 }
 
-impl<'a, L, R, C> TrComparer<SlotPtr<L>, SlotPtr<R>> for HeteroSlotComparer<'a, L, R, C>
+impl<K, V, Q, C> TrComparer<SlotPtr<(K, V)>, Q> for QuerySlotComparer<'_, K, V, Q, C>
 where
-    C: TrComparer<L, R>,
+    Q: ?Sized,
+    C: TrComparer<K, Q>,
 {
     #[inline]
-    fn compare(&self, a: &SlotPtr<L>, b: &SlotPtr<R>) -> Ordering {
-        self.comparer_.compare(&**a, &**b)
+    fn compare(&self, a: &SlotPtr<(K, V)>, b: &Q) -> Ordering {
+        let (a_key, _) = &**a;
+        self.comparer_.compare(a_key, b)
     }
 }
