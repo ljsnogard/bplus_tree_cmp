@@ -16,10 +16,12 @@ mod comparer_;
 mod node_;
 mod ordered_arr_;
 mod search_;
+mod slab_list_;
 mod tree_;
 
 pub use comparer_::{OrdComparer, TrComparer};
 pub use ordered_arr_::{Iter, OrderedArray, TryInsertResult};
+pub use slab_list_::{SlabList, SlabListConfig, SlabListError, SlotPtr};
 pub use tree_::BPlusTree;
 
 pub mod x_deps {
