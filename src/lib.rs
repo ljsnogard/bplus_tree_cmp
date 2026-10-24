@@ -17,12 +17,12 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
-mod bplus_tree_;
+pub mod bplus_tree;
 mod comparer_;
 mod ordered_arr_;
 mod slab_list_;
 
-pub use bplus_tree_::{BPlusTree, ConflictInfo, TreeIter};
+pub use bplus_tree::{BPlusTree, ConflictInfo, TreeIter};
 pub use comparer_::{OrdComparer, TrComparer};
 pub use ordered_arr_::{
     ConflictInfo as ArrayConflictInfo, ConflictItem, Iter, OrderedArray, TryInsertResult,
