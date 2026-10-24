@@ -10,10 +10,9 @@
 //! 因此 path 的内存来自与树节点相同的 Chunk 分配策略，不会引入额外的
 //! 长期堆碎片来源。
 
-use crate::{
-    node_::TreeNodePtr,
-    slab_list_::{SlabList, SlotPtr},
-};
+use crate::slab_list_::{SlabList, SlotPtr};
+
+use super::node_::TreeNodePtr;
 
 /// 路径栈中的一帧。
 pub(crate) struct PathFrame<const M: usize, K, V> {

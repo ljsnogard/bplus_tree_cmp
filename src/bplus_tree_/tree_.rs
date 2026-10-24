@@ -35,11 +35,14 @@ use core::{borrow::Borrow, iter::FusedIterator, marker::PhantomData, mem};
 
 use crate::{
     comparer_::{QuerySlotComparer, SlotPairKeyComparer, TrComparer},
-    node_::{DataLeaf, IndexNode, IndexPtrOrdArr, TreeNode, TreeNodePtr},
     ordered_arr_::OrderedArray,
+    slab_list_::{SlabList, SlabListError, SlotPtr},
+};
+
+use super::{
+    node_::{DataLeaf, IndexNode, IndexPtrOrdArr, TreeNode, TreeNodePtr},
     path_::{Path, PathFrame},
     search_::{descend_to_leaf_, find_in_leaf_, find_leaf_},
-    slab_list_::{SlabList, SlabListError, SlotPtr},
 };
 
 /// 非根节点的最小项数。

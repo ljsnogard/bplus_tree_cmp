@@ -25,6 +25,26 @@ BPlusTreeCmp 的核心思想很简单：
 
 ---
 
+# 模块结构
+
+```text
+src/
+├── comparer_.rs       独立的 Comparer trait 与内置实现
+├── slab_list_/        共享的 Chunk Arena
+├── ordered_arr_.rs    通用固定容量有序数组，可被其他索引结构复用
+└── bplus_tree_/       B+ Tree 专有实现
+    ├── mod.rs         模块边界与公开类型导出
+    ├── tree_.rs       BPlusTree 与公开 API
+    ├── node_.rs       IndexNode / DataLeaf / TreeNode
+    ├── search_.rs     下沉与叶子定位
+    └── path_.rs       SlabList 分配的祖先路径帧
+```
+
+`Comparer`、`SlabList` 和 `OrderedArray` 不依赖 B+ Tree；后续基于同一 Arena 的
+B Tree 可以直接复用它们，而不需要反过来依赖 `bplus_tree_`。
+
+---
+
 ## 核心特点
 
 ### 1. Comparer 定义排序，而不是 Key

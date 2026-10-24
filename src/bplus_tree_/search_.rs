@@ -10,9 +10,12 @@
 
 use crate::{
     comparer_::TrComparer,
-    node_::{DataLeaf, TreeNode, TreeNodePtr},
-    path_::{Path, PathFrame},
     slab_list_::{SlabList, SlotPtr},
+};
+
+use super::{
+    node_::{DataLeaf, IndexNode, TreeNode, TreeNodePtr},
+    path_::{Path, PathFrame},
 };
 
 /// 从 `root` 开始下沉到叶子，并把每一层 `(索引节点, 孩子下标)` 压入 `path`。
@@ -89,7 +92,7 @@ where
 
 /// 在索引节点中选择孩子，返回 `(孩子下标, 孩子指针)`。
 fn child_for_<const M: usize, K, V, Q, C>(
-    index: &crate::node_::IndexNode<M, K, V>,
+    index: &IndexNode<M, K, V>,
     query: &Q,
     cmp: &C,
 ) -> Option<(usize, TreeNodePtr<M, K, V>)>
