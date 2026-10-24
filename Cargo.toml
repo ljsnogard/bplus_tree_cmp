@@ -1,0 +1,19 @@
+[package]
+name = "bplus_tree_cmp"
+version = "0.1.0"
+edition = "2024"
+description = """
+Comparer-first B+ tree and B tree containers, allocated with SlabList.
+"""
+license = "AGPL-3.0-only"
+
+[lib]
+name = "bplustree_cmp"
+path = "src/lib.rs"
+
+[dev-dependencies]
+rand = "0.9"
+
+[[bench]]
+name = "btreemap_compare"
+harness = false
