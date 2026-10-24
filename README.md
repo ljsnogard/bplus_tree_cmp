@@ -162,7 +162,7 @@ first_leaf_: Option<TreeNodePtr<M, K, V>>,
 last_leaf_: Option<TreeNodePtr<M, K, V>>,
 ```
 
-这样不需要单独的 `RootNode` 变体，也不需要让节点保存父指针；插入和删除使用显式 path 栈。
+这样不需要单独的 `RootNode` 变体，也不需要让节点保存父指针；插入和删除使用显式 path 栈。path 帧不是 `Vec`，而是由独立的 `SlabList<PathFrame>` 分配固定大小的帧并在操作结束后归还，避免在长期运行中引入新的堆分配碎片来源。
 
 ### Index
 
@@ -353,21 +353,21 @@ BENCH_N=500000 BENCH_SAMPLES=7 cargo bench --bench btreemap_compare
 
 | operation   | B+Tree(M=4) | B+Tree(M=16) | BTreeMap |
 | ----------- | ----------: | -----------: | -------: |
-| insert      |     1863.61 |      1600.30 |   434.24 |
-| lookup hit  |     1878.61 |      1790.08 |   474.40 |
-| lookup miss |      155.40 |        88.91 |   127.18 |
-| iterate     |       91.87 |        66.34 |    28.42 |
-| remove      |     2139.10 |      1824.92 |   605.95 |
+| insert      |     1973.99 |      1758.03 |   447.07 |
+| lookup hit  |     1926.60 |      1862.02 |   481.68 |
+| lookup miss |      153.46 |        89.91 |   103.63 |
+| iterate     |       96.34 |        70.98 |    28.19 |
+| remove      |     2232.97 |      1910.38 |   622.52 |
 
 相对 `BTreeMap` 的倍数：
 
 | operation   | B+Tree(M=4) | B+Tree(M=16) |
 | ----------- | ----------: | -----------: |
-| insert      |       4.29x |        3.69x |
-| lookup hit  |       3.96x |        3.77x |
-| lookup miss |       1.22x |        0.70x |
-| iterate     |       3.23x |        2.33x |
-| remove      |       3.53x |        3.01x |
+| insert      |       4.42x |        3.93x |
+| lookup hit  |       4.00x |        3.87x |
+| lookup miss |       1.48x |        0.87x |
+| iterate     |       3.42x |        2.52x |
+| remove      |       3.59x |        3.07x |
 
 几个符合设计预期的现象：
 
@@ -376,7 +376,8 @@ BENCH_N=500000 BENCH_SAMPLES=7 cargo bench --bench btreemap_compare
   解引用到 Data SlabList，而 `BTreeMap` 把 key 直接放在节点里。这正是“不复制 Key”
   的性能代价；
 * 未命中查询可以比 `BTreeMap` 更快：B+ Tree 更浅，提前失败；
-* 插入/删除仍包含一次 path `Vec` 分配；只读查询已经改为无 path 分配的下沉路径；
+* 插入/删除的祖先路径由独立的 path `SlabList` 分配固定大小 `PathFrame`，操作结束后归还；不会产生每次操作的 `Vec` 堆分配；
+* 只读查询不触碰 path `SlabList`；
 * 迭代需要沿叶子链并逐个解引用数据句柄，因此比 `BTreeMap` 的节点内迭代慢。
 
 对于 `String`、`Vec<u8>` 或大型结构体这类 Key，避免复制带来的收益可能抵消上述

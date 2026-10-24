@@ -8,20 +8,16 @@
 //!
 //! 搜索本身不复制 Key，只比较 `SlotPtr` 解引用后的实际数据。
 
-use alloc::vec::Vec;
-
 use crate::{
     comparer_::TrComparer,
     node_::{DataLeaf, TreeNode, TreeNodePtr},
-    slab_list_::SlotPtr,
+    path_::{Path, PathFrame},
+    slab_list_::{SlabList, SlotPtr},
 };
 
-/// 从 root 到叶子的路径：`(索引节点, 被选中的孩子下标)`。
-pub(crate) type DescentPath<const M: usize, K, V> = Vec<(TreeNodePtr<M, K, V>, usize)>;
-
-/// 从 `root` 开始下沉，返回叶子指针以及与每一层索引节点的选择路径。
+/// 从 `root` 开始下沉到叶子，并把每一层 `(索引节点, 孩子下标)` 压入 `path`。
 ///
-/// 路径元素为 `(索引节点, 被选中的孩子下标)`，按从 root 到叶子的顺序排列。
+/// path 帧由 `path_arena` 分配；返回后路径按“叶子父节点 -> root”的方向链接。
 /// 插入和删除会利用该路径自底向上维护 separator。
 ///
 /// # 安全性
@@ -33,12 +29,13 @@ pub(crate) fn descend_to_leaf_<const M: usize, K, V, Q, C>(
     root: TreeNodePtr<M, K, V>,
     query: &Q,
     cmp: &C,
-) -> (TreeNodePtr<M, K, V>, DescentPath<M, K, V>)
+    path: &mut Path<M, K, V>,
+    path_arena: &mut SlabList<PathFrame<M, K, V>>,
+) -> TreeNodePtr<M, K, V>
 where
     Q: ?Sized,
     C: TrComparer<SlotPtr<(K, V)>, Q>,
 {
-    let mut path = DescentPath::with_capacity(8);
     let mut current = root;
 
     loop {
@@ -47,22 +44,22 @@ where
         let node = unsafe { &*current.as_ptr() };
 
         let TreeNode::Index(index) = node else {
-            return (current, path);
+            return current;
         };
 
         let Option::Some((pos, child)) = child_for_(index, query, cmp) else {
             // 损坏的索引节点；返回当前指针，让上层按“找不到”处理。
-            return (current, path);
+            return current;
         };
 
-        path.push((current, pos));
+        path.push_(path_arena, current, pos);
         current = child;
     }
 }
 
 /// 从 root 下沉到叶子，但不记录 path。
 ///
-/// 只读查询不需要 path，因此可以避免每次查询的 `Vec` 分配。
+/// 只读查询不需要 path，因此不会触碰 path SlabList。
 pub(crate) fn find_leaf_<const M: usize, K, V, Q, C>(
     root: TreeNodePtr<M, K, V>,
     query: &Q,

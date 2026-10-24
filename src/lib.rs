@@ -17,6 +17,7 @@ extern crate std;
 mod comparer_;
 mod node_;
 mod ordered_arr_;
+mod path_;
 mod search_;
 mod slab_list_;
 mod tree_;

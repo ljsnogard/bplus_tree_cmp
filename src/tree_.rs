@@ -37,7 +37,8 @@ use crate::{
     comparer_::{QuerySlotComparer, SlotPairKeyComparer, TrComparer},
     node_::{DataLeaf, IndexNode, IndexPtrOrdArr, TreeNode, TreeNodePtr},
     ordered_arr_::OrderedArray,
-    search_::{DescentPath, descend_to_leaf_, find_in_leaf_, find_leaf_},
+    path_::{Path, PathFrame},
+    search_::{descend_to_leaf_, find_in_leaf_, find_leaf_},
     slab_list_::{SlabList, SlabListError, SlotPtr},
 };
 
@@ -163,24 +164,38 @@ fn set_separator_at_<const M: usize, K, V, C>(
     );
 }
 
-/// 从 `depth` 位置开始向上刷新 separator。
+/// 路径帧的三个字段：节点、孩子下标、前驱帧。
+type FrameValues<const M: usize, K, V> = (
+    TreeNodePtr<M, K, V>,
+    usize,
+    Option<SlotPtr<PathFrame<M, K, V>>>,
+);
+
+/// 读取路径帧的三个字段，避免持有帧引用跨越后续可变操作。
+fn frame_values_<const M: usize, K, V>(
+    frame_ptr: SlotPtr<PathFrame<M, K, V>>,
+) -> FrameValues<M, K, V> {
+    let frame = &*frame_ptr;
+    (frame.node_, frame.child_idx_, frame.prev_)
+}
+
+/// 从路径帧 `cursor` 开始向上刷新 separator。
 ///
-/// `depth` 是当前节点在 path 中的深度；它的父节点是 `path[depth - 1]`。
-/// 当父节点的最大 key 没有变化时提前停止，因为更上层的 separator 不会变化。
+/// `cursor` 指向当前节点的父节点帧；每一层把父项的分隔 key 更新为
+/// `child_max`，当父节点最大 key 没有变化时提前停止。
 fn refresh_separators_<const M: usize, K, V, C>(
-    path: &[(TreeNodePtr<M, K, V>, usize)],
-    mut depth: usize,
+    mut cursor: Option<SlotPtr<PathFrame<M, K, V>>>,
     mut child_max: SlotPtr<(K, V)>,
     cmp: &C,
 ) where
     C: TrComparer<SlotPtr<(K, V)>>,
 {
-    while depth > 0 {
-        let (parent_ptr, idx) = path[depth - 1];
+    while let Option::Some(frame_ptr) = cursor {
+        let (parent_ptr, idx, prev) = frame_values_(frame_ptr);
         let old_parent_max = node_max_(parent_ptr);
 
         {
-            // SAFETY: parent_ptr 由 path 来自当前树；此处没有其他别名。
+            // SAFETY: parent_ptr 来自当前树的路径帧；此处没有其他别名。
             let parent = match unsafe { node_mut_(parent_ptr) }.as_index_mut_() {
                 Option::Some(parent) => parent,
                 Option::None => return,
@@ -196,7 +211,7 @@ fn refresh_separators_<const M: usize, K, V, C>(
             break;
         };
         child_max = new_max;
-        depth -= 1;
+        cursor = prev;
     }
 }
 
@@ -367,7 +382,7 @@ fn insert_data_into_tree_<const M: usize, K, V, C>(
     root: &mut Option<TreeNodePtr<M, K, V>>,
     last_leaf: &mut Option<TreeNodePtr<M, K, V>>,
     leaf_ptr: TreeNodePtr<M, K, V>,
-    path: DescentPath<M, K, V>,
+    path: &Path<M, K, V>,
     data_ptr: SlotPtr<(K, V)>,
     cmp: &C,
 ) where
@@ -388,7 +403,7 @@ fn insert_data_into_tree_<const M: usize, K, V, C>(
         let Option::Some(leaf_max) = node_max_(leaf_ptr) else {
             return;
         };
-        refresh_separators_(&path, path.len(), leaf_max, cmp);
+        refresh_separators_(path.head_(), leaf_max, cmp);
         return;
     }
 
@@ -401,14 +416,14 @@ fn insert_data_into_tree_<const M: usize, K, V, C>(
     let mut pending = Option::Some((right_max, right_ptr));
     let mut child_max = left_max;
 
-    if path.is_empty() {
+    if path.is_empty_() {
         create_root_with_two_(nodes, root, leaf_ptr, left_max, right_ptr, right_max, cmp);
         return;
     }
 
-    let mut level = path.len();
-    while level > 0 {
-        let (parent_ptr, idx) = path[level - 1];
+    let mut cursor = path.head_();
+    while let Option::Some(frame_ptr) = cursor {
+        let (parent_ptr, idx, prev) = frame_values_(frame_ptr);
         let parent_len = node_len_(parent_ptr);
         let old_parent_max = node_max_(parent_ptr);
 
@@ -440,13 +455,13 @@ fn insert_data_into_tree_<const M: usize, K, V, C>(
                         break;
                     };
                     child_max = new_max;
-                    level -= 1;
+                    cursor = prev;
                 } else {
                     let (left, right, right_node) =
                         split_index_with_(nodes, parent_ptr, (right_sep, right_child), cmp);
                     pending = Option::Some((right, right_node));
                     child_max = left;
-                    level -= 1;
+                    cursor = prev;
                 }
             }
             Option::None => {
@@ -458,7 +473,7 @@ fn insert_data_into_tree_<const M: usize, K, V, C>(
                     break;
                 };
                 child_max = new_max;
-                level -= 1;
+                cursor = prev;
             }
         }
     }
@@ -608,7 +623,7 @@ fn clear_root_<const M: usize, K, V>(
 
 /// 在删除一项后修复节点占用与 separator。
 ///
-/// `depth` 是 `current_ptr` 在 `path` 中的深度；叶子的深度是 `path.len()`。
+/// `cursor` 指向当前节点的父节点路径帧；`None` 表示当前节点已经是 root。
 /// 该函数只处理树结构，不负责从 data arena 删除元素。
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::collapsible_if)] // 保留“先左后右”的借位语义，避免 let-chain 降低可读性
@@ -617,10 +632,9 @@ fn rebalance_after_remove_<const M: usize, K, V, C>(
     root: &mut Option<TreeNodePtr<M, K, V>>,
     first_leaf: &mut Option<TreeNodePtr<M, K, V>>,
     last_leaf: &mut Option<TreeNodePtr<M, K, V>>,
-    path: &[(TreeNodePtr<M, K, V>, usize)],
     mut current_ptr: TreeNodePtr<M, K, V>,
     mut current_max: Option<SlotPtr<(K, V)>>,
-    mut depth: usize,
+    mut cursor: Option<SlotPtr<PathFrame<M, K, V>>>,
     cmp: &C,
 ) where
     C: TrComparer<SlotPtr<(K, V)>>,
@@ -629,7 +643,7 @@ fn rebalance_after_remove_<const M: usize, K, V, C>(
 
     loop {
         // 1. 当前节点已经是 root。
-        if depth == 0 {
+        let Option::Some(frame_ptr) = cursor else {
             let (is_leaf, node_len) = {
                 let node = unsafe { node_ref_(current_ptr) };
                 (node.is_leaf_(), node.len_())
@@ -662,12 +676,12 @@ fn rebalance_after_remove_<const M: usize, K, V, C>(
                 _ => {}
             }
             return;
-        }
+        };
 
-        let (parent_ptr, idx) = path[depth - 1];
+        let (parent_ptr, idx, prev) = frame_values_(frame_ptr);
 
         // 2. root 只有一个孩子：root 收缩为该孩子。
-        if depth == 1 && node_len_(parent_ptr) == 1 {
+        if prev.is_none() && node_len_(parent_ptr) == 1 {
             if node_len_(current_ptr) == 0 {
                 if node_is_leaf_(current_ptr) {
                     unlink_leaf_(current_ptr, first_leaf, last_leaf);
@@ -690,7 +704,7 @@ fn rebalance_after_remove_<const M: usize, K, V, C>(
         // 3. 当前节点不再低于最小占用：刷新 separator 后结束。
         if node_len_(current_ptr) >= min {
             if let Option::Some(max) = current_max {
-                refresh_separators_(path, depth, max, cmp);
+                refresh_separators_(cursor, max, cmp);
             }
             return;
         }
@@ -712,15 +726,15 @@ fn rebalance_after_remove_<const M: usize, K, V, C>(
 
                 current_ptr = parent_ptr;
                 current_max = Option::None;
-                depth -= 1;
+                cursor = prev;
                 continue;
             }
 
             // 父节点只有当前孩子，直接用当前节点替换父节点。
-            if depth < 2 {
+            let Option::Some(grand_frame) = prev else {
                 return;
-            }
-            let (grand_ptr, grand_idx) = path[depth - 2];
+            };
+            let (grand_ptr, grand_idx, _) = frame_values_(grand_frame);
             match unsafe { node_mut_(grand_ptr) }.as_index_mut_() {
                 Option::Some(grand) => match grand.children_.get_mut_at(grand_idx) {
                     Ok((_, child_slot)) => *child_slot = current_ptr,
@@ -730,7 +744,7 @@ fn rebalance_after_remove_<const M: usize, K, V, C>(
             }
             let _ = nodes.remove(parent_ptr);
             current_max = node_max_(current_ptr);
-            depth -= 1;
+            cursor = prev;
             continue;
         }
 
@@ -790,7 +804,7 @@ fn rebalance_after_remove_<const M: usize, K, V, C>(
                                 }
                                 let parent_max = node_max_(parent_ptr);
                                 if let Option::Some(parent_max) = parent_max {
-                                    refresh_separators_(path, depth - 1, parent_max, cmp);
+                                    refresh_separators_(prev, parent_max, cmp);
                                 }
                             }
                             return;
@@ -835,7 +849,7 @@ fn rebalance_after_remove_<const M: usize, K, V, C>(
                                 }
                                 let parent_max = node_max_(parent_ptr);
                                 if let Option::Some(parent_max) = parent_max {
-                                    refresh_separators_(path, depth - 1, parent_max, cmp);
+                                    refresh_separators_(prev, parent_max, cmp);
                                 }
                             }
                             return;
@@ -873,7 +887,7 @@ fn rebalance_after_remove_<const M: usize, K, V, C>(
 
             current_ptr = parent_ptr;
             current_max = node_max_(parent_ptr);
-            depth -= 1;
+            cursor = prev;
         } else {
             // 7. 索引节点：借位或合并。
             if current_len > 0 {
@@ -915,7 +929,7 @@ fn rebalance_after_remove_<const M: usize, K, V, C>(
                                 }
                                 let parent_max = node_max_(parent_ptr);
                                 if let Option::Some(parent_max) = parent_max {
-                                    refresh_separators_(path, depth - 1, parent_max, cmp);
+                                    refresh_separators_(prev, parent_max, cmp);
                                 }
                             }
                             return;
@@ -959,7 +973,7 @@ fn rebalance_after_remove_<const M: usize, K, V, C>(
                                 }
                                 let parent_max = node_max_(parent_ptr);
                                 if let Option::Some(parent_max) = parent_max {
-                                    refresh_separators_(path, depth - 1, parent_max, cmp);
+                                    refresh_separators_(prev, parent_max, cmp);
                                 }
                             }
                             return;
@@ -995,19 +1009,55 @@ fn rebalance_after_remove_<const M: usize, K, V, C>(
 
             current_ptr = parent_ptr;
             current_max = node_max_(parent_ptr);
-            depth -= 1;
+            cursor = prev;
         }
     }
 }
 
-/// 删除查找结果。
+/// 插入查找结果。
 enum InsertLocate<const M: usize, K, V> {
     /// 树为空。
     Empty,
     /// 已存在等价 key。
     Conflict(SlotPtr<(K, V)>),
-    /// 不存在等价 key，给出目标叶子与 path。
-    Missing(TreeNodePtr<M, K, V>, DescentPath<M, K, V>),
+    /// 不存在等价 key，给出目标叶子。祖先路径已写入树内的 path。
+    Missing(TreeNodePtr<M, K, V>),
+}
+
+/// 查找插入位置，并把祖先路径写入 `path`。
+///
+/// 路径帧由 `path_arena` 分配；调用方负责在操作结束后调用
+/// [`Path::clear_`] 归还帧。
+fn locate_for_insert_parts_<const M: usize, K, V, Q, TyCmp>(
+    root: Option<TreeNodePtr<M, K, V>>,
+    query: &Q,
+    cmp: &TyCmp,
+    path: &mut Path<M, K, V>,
+    path_arena: &mut SlabList<PathFrame<M, K, V>>,
+) -> InsertLocate<M, K, V>
+where
+    Q: ?Sized,
+    TyCmp: TrComparer<K, Q>,
+{
+    path.clear_(path_arena);
+
+    let Option::Some(root) = root else {
+        return InsertLocate::Empty;
+    };
+
+    let query_cmp = QuerySlotComparer::new_(cmp);
+    let leaf_ptr = descend_to_leaf_(root, query, &query_cmp, path, path_arena);
+
+    // SAFETY: 叶子指针由树维护；搜索期间结构不变。
+    let node = unsafe { node_ref_(leaf_ptr) };
+    let Option::Some(leaf) = node.as_leaf_() else {
+        return InsertLocate::Missing(leaf_ptr);
+    };
+
+    match find_in_leaf_(leaf, query, &query_cmp) {
+        Ok((_, data_ptr)) => InsertLocate::Conflict(data_ptr),
+        Err(_) => InsertLocate::Missing(leaf_ptr),
+    }
 }
 
 impl<const M: usize, C, K, V> BPlusTree<M, C, K, V>
@@ -1049,6 +1099,8 @@ where
             last_leaf_: Option::None,
             data_arena_: SlabList::new(Global)?,
             node_arena_: SlabList::new(Global)?,
+            path_: Path::new_(),
+            path_arena_: SlabList::new(Global)?,
         })
     }
 
@@ -1162,31 +1214,6 @@ where
         Option::Some(unsafe { data_pair_mut_(data_ptr) })
     }
 
-    /// 查找插入位置。
-    fn locate_for_insert_<Q, TyCmp>(&self, query: &Q, cmp: &TyCmp) -> InsertLocate<M, K, V>
-    where
-        Q: ?Sized,
-        TyCmp: TrComparer<K, Q>,
-    {
-        let Option::Some(root) = self.tree_root_ else {
-            return InsertLocate::Empty;
-        };
-
-        let query_cmp = QuerySlotComparer::new_(cmp);
-        let (leaf_ptr, path) = descend_to_leaf_(root, query, &query_cmp);
-
-        // SAFETY: 叶子指针由树维护；&self 保证期间结构不变。
-        let node = unsafe { node_ref_(leaf_ptr) };
-        let Option::Some(leaf) = node.as_leaf_() else {
-            return InsertLocate::Missing(leaf_ptr, path);
-        };
-
-        match find_in_leaf_(leaf, query, &query_cmp) {
-            Ok((_, data_ptr)) => InsertLocate::Conflict(data_ptr),
-            Err(_) => InsertLocate::Missing(leaf_ptr, path),
-        }
-    }
-
     /// 在空树中插入第一个元素。
     fn insert_first_entry_(&mut self, pair: (K, V)) -> SlotPtr<(K, V)> {
         let data_ptr = self.data_arena_.insert(pair);
@@ -1207,11 +1234,12 @@ where
     }
 
     /// 把已写入 data arena 的新数据插入树结构。
+    ///
+    /// 祖先路径已经保存在 `self.path_` 中，插入完成后会立即归还帧。
     fn insert_data_after_locate_(
         &mut self,
         data_ptr: SlotPtr<(K, V)>,
         leaf_ptr: TreeNodePtr<M, K, V>,
-        path: DescentPath<M, K, V>,
     ) {
         let node_cmp = SlotPairKeyComparer::new_(&self.comparer_);
         insert_data_into_tree_(
@@ -1219,10 +1247,11 @@ where
             &mut self.tree_root_,
             &mut self.last_leaf_,
             leaf_ptr,
-            path,
+            &self.path_,
             data_ptr,
             &node_cmp,
         );
+        self.path_.clear_(&mut self.path_arena_);
         self.len_ += 1;
     }
 
@@ -1248,8 +1277,17 @@ where
         Q: ?Sized,
         TyCmp: TrComparer<K, Q>,
     {
-        match self.locate_for_insert_(query, cmp) {
+        let located = locate_for_insert_parts_(
+            self.tree_root_,
+            query,
+            cmp,
+            &mut self.path_,
+            &mut self.path_arena_,
+        );
+
+        match located {
             InsertLocate::Conflict(data_ptr) => {
+                self.path_.clear_(&mut self.path_arena_);
                 // SAFETY: data_ptr 指向树中仍存活的数据；&mut self 保证独占访问。
                 Err(ConflictInfo {
                     existing_: unsafe { data_pair_mut_(data_ptr) },
@@ -1261,9 +1299,9 @@ where
                 // SAFETY: 刚插入的数据存活；&mut self 保证独占访问。
                 Ok(unsafe { data_pair_mut_(data_ptr) })
             }
-            InsertLocate::Missing(leaf_ptr, path) => {
+            InsertLocate::Missing(leaf_ptr) => {
                 let data_ptr = self.data_arena_.insert(factory(query));
-                self.insert_data_after_locate_(data_ptr, leaf_ptr, path);
+                self.insert_data_after_locate_(data_ptr, leaf_ptr);
                 // SAFETY: 刚插入的数据存活；&mut self 保证独占访问。
                 Ok(unsafe { data_pair_mut_(data_ptr) })
             }
@@ -1286,10 +1324,17 @@ where
     ) -> Result<(&'f K, &'f mut V), ConflictInfo<'f, K, V>> {
         let pair = (key, value);
 
-        let located = self.locate_for_insert_(&pair.0, &self.comparer_);
+        let located = locate_for_insert_parts_(
+            self.tree_root_,
+            &pair.0,
+            &self.comparer_,
+            &mut self.path_,
+            &mut self.path_arena_,
+        );
 
         match located {
             InsertLocate::Conflict(data_ptr) => {
+                self.path_.clear_(&mut self.path_arena_);
                 // SAFETY: data_ptr 指向树中仍存活的数据；&mut self 保证独占访问。
                 Err(ConflictInfo {
                     existing_: unsafe { data_pair_mut_(data_ptr) },
@@ -1301,9 +1346,9 @@ where
                 // SAFETY: 刚插入的数据存活；&mut self 保证独占访问。
                 Ok(unsafe { data_pair_mut_(data_ptr) })
             }
-            InsertLocate::Missing(leaf_ptr, path) => {
+            InsertLocate::Missing(leaf_ptr) => {
                 let data_ptr = self.data_arena_.insert(pair);
-                self.insert_data_after_locate_(data_ptr, leaf_ptr, path);
+                self.insert_data_after_locate_(data_ptr, leaf_ptr);
                 // SAFETY: 刚插入的数据存活；&mut self 保证独占访问。
                 Ok(unsafe { data_pair_mut_(data_ptr) })
             }
@@ -1359,6 +1404,8 @@ where
             &mut self.first_leaf_,
             &mut self.last_leaf_,
             &mut self.len_,
+            &mut self.path_,
+            &mut self.path_arena_,
             query_ref,
             &self.comparer_,
             &self.comparer_,
@@ -1389,6 +1436,8 @@ where
             &mut self.first_leaf_,
             &mut self.last_leaf_,
             &mut self.len_,
+            &mut self.path_,
+            &mut self.path_arena_,
             query,
             cmp,
             &self.comparer_,
@@ -1460,6 +1509,8 @@ fn remove_entry_by_<const M: usize, K, V, Q, TyCmp, C>(
     first_leaf: &mut Option<TreeNodePtr<M, K, V>>,
     last_leaf: &mut Option<TreeNodePtr<M, K, V>>,
     len: &mut usize,
+    path: &mut Path<M, K, V>,
+    path_arena: &mut SlabList<PathFrame<M, K, V>>,
     query: &Q,
     query_cmp: &TyCmp,
     key_cmp: &C,
@@ -1469,21 +1520,33 @@ where
     TyCmp: TrComparer<K, Q>,
     C: TrComparer<K>,
 {
-    let root = (*tree_root)?;
-    let query_cmp = QuerySlotComparer::new_(query_cmp);
-    let (leaf_ptr, path) = descend_to_leaf_(root, query, &query_cmp);
+    path.clear_(path_arena);
 
-    let (pos, data_ptr) = {
+    let root = (*tree_root)?;
+
+    let query_cmp = QuerySlotComparer::new_(query_cmp);
+    let leaf_ptr = descend_to_leaf_(root, query, &query_cmp, path, path_arena);
+
+    let found = {
         // SAFETY: 叶子指针由树维护；调用期间 &mut 字段保证没有其他别名。
-        let leaf = unsafe { node_ref_(leaf_ptr) }.as_leaf_()?;
-        find_in_leaf_(leaf, query, &query_cmp).ok()?
+        match unsafe { node_ref_(leaf_ptr) }.as_leaf_() {
+            Option::Some(leaf) => find_in_leaf_(leaf, query, &query_cmp).ok(),
+            Option::None => Option::None,
+        }
+    };
+    let Option::Some((pos, data_ptr)) = found else {
+        path.clear_(path_arena);
+        return Option::None;
     };
 
     let removed = match unsafe { node_mut_(leaf_ptr) }.as_leaf_mut_() {
         Option::Some(leaf) => leaf.order_arr_.try_remove_at(pos),
         Option::None => Option::None,
     };
-    let (removed_ptr, ()) = removed?;
+    let Option::Some((removed_ptr, ())) = removed else {
+        path.clear_(path_arena);
+        return Option::None;
+    };
     debug_assert_eq!(removed_ptr, data_ptr);
 
     let leaf_max = node_max_(leaf_ptr);
@@ -1493,13 +1556,13 @@ where
         tree_root,
         first_leaf,
         last_leaf,
-        &path,
         leaf_ptr,
         leaf_max,
-        path.len(),
+        path.head_(),
         &node_cmp,
     );
 
+    path.clear_(path_arena);
     *len -= 1;
     Option::Some(data_arena.remove(data_ptr))
 }
@@ -1516,6 +1579,9 @@ where
     last_leaf_: Option<TreeNodePtr<M, K, V>>,
     data_arena_: SlabList<(K, V)>,
     node_arena_: SlabList<TreeNode<M, K, V>>,
+    /// 插入/删除使用的祖先路径栈；帧从 `path_arena_` 分配并在操作后归还。
+    path_: Path<M, K, V>,
+    path_arena_: SlabList<PathFrame<M, K, V>>,
 }
 
 /// 插入冲突信息。
@@ -1674,6 +1740,7 @@ where
 {
     /// 检查树结构与 separator 不变量。
     fn check_invariants_(&self) {
+        assert!(self.path_.is_empty_(), "操作结束后 path 帧应已全部归还");
         let cmp = SlotPairKeyComparer::new_(&self.comparer_);
         let Option::Some(root) = self.tree_root_ else {
             assert_eq!(self.len_, 0);
