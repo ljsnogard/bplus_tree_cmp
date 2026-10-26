@@ -14,6 +14,12 @@
 //! `SlabList`、`OrderedArray`、`SlotPtr` 等保持 crate 内部；两种树都暴露最后
 //! 一个泛型参数 `A = Global`，用于指定内置 `SlabList` 的底层 allocator，
 //! allocator 实例由树自己持有。树构造失败时返回公开的 [`TreeError`]。
+//!
+//! 两种树都提供与 `BTreeMap` 对应的范围与可变迭代 API：`range` / `range_mut`、
+//! 异构 Comparer 版本 `range_with_comparer` / `range_mut_with_comparer`，以及
+//! `iter_mut` / `keys` / `values` / `values_mut`。范围首尾在构造迭代器时一次
+//! 定位，迭代状态是固定大小的游标，不使用工作栈或临时 `Vec`，因此这些 API
+//! 不会带来额外的临时堆分配。
 
 #![no_std]
 
@@ -29,7 +35,13 @@ mod ordered_arr_;
 mod slab_list_;
 mod tree_error_;
 
-pub use bplus_tree::{BPlusTree, ConflictInfo, TreeIter};
-pub use btree::{BTree, ConflictInfo as BTreeConflictInfo, TreeIter as BTreeIter};
+pub use bplus_tree::{
+    BPlusTree, ConflictInfo, IterMut, Keys, RangeIter, RangeIterMut, TreeIter, Values, ValuesMut,
+};
+pub use btree::{
+    BTree, ConflictInfo as BTreeConflictInfo, IterMut as BTreeIterMut, Keys as BTreeKeys,
+    RangeIter as BTreeRangeIter, RangeIterMut as BTreeRangeIterMut, TreeIter as BTreeIter,
+    Values as BTreeValues, ValuesMut as BTreeValuesMut,
+};
 pub use comparer_::{OrdComparer, TrComparer};
 pub use tree_error_::TreeError;

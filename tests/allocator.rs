@@ -170,3 +170,133 @@ fn test_with_comparer_in_accepts_custom_allocator() {
 
     assert_eq!(deallocs.get(), allocs.get());
 }
+
+/// 测试目标：验证 B+ Tree 的 `range` / `range_mut` 与各类迭代 API 不产生临时堆分配。
+/// Test goal: Verify that B+ Tree `range` / `range_mut` and the iterator APIs perform
+/// no temporary heap allocation.
+///
+/// 测试手段：使用 `CountingAlloc` 构建并填充 B+ Tree，记录分配次数后依次执行
+/// `range`（含空范围）、`range_mut`、`keys`、`values`、`values_mut` 与 `iter_mut`。
+/// Test method: Build and fill a B+ Tree with `CountingAlloc`, record the allocation
+/// count, then run `range` (including empty ranges), `range_mut`, `keys`, `values`,
+/// `values_mut`, and `iter_mut`.
+///
+/// 判定标准：所有迭代期间分配次数完全不变；只有树自身的 Chunk 分配被计数，
+/// 说明范围定位与迭代状态没有引入额外堆容器。
+/// Assertions: The allocation count stays exactly unchanged during every iteration;
+/// only the tree's own chunk allocations are counted, proving range positioning and
+/// iteration state introduce no extra heap containers.
+#[test]
+fn test_bplus_tree_iteration_does_not_allocate() {
+    let allocs = Rc::new(Cell::new(0));
+    let deallocs = Rc::new(Cell::new(0));
+    let allocator = CountingAlloc {
+        allocs_: Rc::clone(&allocs),
+        deallocs_: Rc::clone(&deallocs),
+    };
+
+    {
+        let mut tree =
+            BPlusTree::<4, _, i32, i32, _>::new_in(allocator).expect("默认 SlabList 配置应当有效");
+        for key in 0..4096 {
+            tree.insert(key, key);
+        }
+
+        let before = allocs.get();
+        assert!(before > 0);
+
+        let mut checksum = 0i64;
+        for (key, value) in tree.range(100..300) {
+            checksum += i64::from(*key) + i64::from(*value);
+        }
+        for (_, value) in tree.range_mut(400..500) {
+            *value += 1;
+        }
+        for key in tree.keys() {
+            checksum += i64::from(*key);
+        }
+        for value in tree.values() {
+            checksum += i64::from(*value);
+        }
+        for value in tree.values_mut() {
+            *value += 1;
+            checksum += i64::from(*value);
+        }
+        for (key, value) in tree.iter_mut() {
+            checksum += i64::from(*key) + i64::from(*value);
+        }
+        checksum += tree.range(..).count() as i64;
+        checksum += tree.range(10..10).count() as i64;
+        checksum += tree.range(9000..10000).count() as i64;
+        assert!(checksum > 0);
+
+        assert_eq!(allocs.get(), before);
+        assert_eq!(deallocs.get(), 0);
+    }
+
+    assert_eq!(deallocs.get(), allocs.get());
+}
+
+/// 测试目标：验证 B Tree 的 `range` / `range_mut` 与各类迭代 API 不产生临时堆分配。
+/// Test goal: Verify that B Tree `range` / `range_mut` and the iterator APIs perform no
+/// temporary heap allocation.
+///
+/// 测试手段：使用 `CountingAlloc` 构建并填充 B Tree，记录分配次数后依次执行
+/// `range`（含空范围）、`range_mut`、`keys`、`values`、`values_mut` 与 `iter_mut`。
+/// Test method: Build and fill a B Tree with `CountingAlloc`, record the allocation
+/// count, then run `range` (including empty ranges), `range_mut`, `keys`, `values`,
+/// `values_mut`, and `iter_mut`.
+///
+/// 判定标准：所有迭代期间分配次数完全不变，且树 drop 后释放次数等于分配次数。
+/// Assertions: The allocation count stays exactly unchanged during every iteration,
+/// and after the tree is dropped the deallocation count equals the allocation count.
+#[test]
+fn test_btree_iteration_does_not_allocate() {
+    let allocs = Rc::new(Cell::new(0));
+    let deallocs = Rc::new(Cell::new(0));
+    let allocator = CountingAlloc {
+        allocs_: Rc::clone(&allocs),
+        deallocs_: Rc::clone(&deallocs),
+    };
+
+    {
+        let mut tree =
+            BTree::<4, _, i32, i32, _>::new_in(allocator).expect("默认 SlabList 配置应当有效");
+        for key in 0..4096 {
+            tree.insert(key, key);
+        }
+
+        let before = allocs.get();
+        assert!(before > 0);
+
+        let mut checksum = 0i64;
+        for (key, value) in tree.range(100..300) {
+            checksum += i64::from(*key) + i64::from(*value);
+        }
+        for (_, value) in tree.range_mut(400..500) {
+            *value += 1;
+        }
+        for key in tree.keys() {
+            checksum += i64::from(*key);
+        }
+        for value in tree.values() {
+            checksum += i64::from(*value);
+        }
+        for value in tree.values_mut() {
+            *value += 1;
+            checksum += i64::from(*value);
+        }
+        for (key, value) in tree.iter_mut() {
+            checksum += i64::from(*key) + i64::from(*value);
+        }
+        checksum += tree.range(..).count() as i64;
+        checksum += tree.range(10..10).count() as i64;
+        checksum += tree.range(9000..10000).count() as i64;
+        assert!(checksum > 0);
+
+        assert_eq!(allocs.get(), before);
+        assert_eq!(deallocs.get(), 0);
+    }
+
+    assert_eq!(deallocs.get(), allocs.get());
+}

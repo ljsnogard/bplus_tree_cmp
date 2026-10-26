@@ -15,10 +15,19 @@
 //! 这样内部节点最多保存 `M` 个数据项和 `M + 1` 个孩子，而不需要额外引入
 //! `M + 1` 容量的数组（Rust 稳定版尚不支持在数组长度中使用泛型常量表达式）。
 
+use core::ptr;
+
 use crate::{ordered_arr_::OrderedArray, slab_list_::SlotPtr};
 
 /// 指向 B 树节点的类型安全句柄。
 pub(crate) type TreeNodePtr<const M: usize, K, V> = SlotPtr<Node<M, K, V>>;
+
+/// 节点内位置：节点句柄与逻辑下标。
+pub(crate) type NodePosition<const M: usize, K, V = ()> = (TreeNodePtr<M, K, V>, usize);
+
+/// 一个范围的首、尾位置。
+pub(crate) type RangePositions<const M: usize, K, V = ()> =
+    (NodePosition<M, K, V>, NodePosition<M, K, V>);
 
 /// 通过 `SlotPtr` 取得 B Tree 节点引用。
 ///
@@ -280,4 +289,111 @@ pub(crate) unsafe fn entry_mut_<'a, const M: usize, K, V>(
         Ok((key, node_value)) => (key, &mut node_value.value_),
         Err(_) => unreachable!("B 树节点下标应有效"),
     }
+}
+
+/// 通过裸指针判断节点是否为叶子。
+///
+/// # 安全性
+///
+/// `ptr` 必须指向当前树中仍然存活的节点。
+pub(crate) unsafe fn node_is_leaf_raw_<const M: usize, K, V>(ptr: TreeNodePtr<M, K, V>) -> bool {
+    let node = ptr.as_ptr();
+    // SAFETY: 只读取 first_child_ 字段，不创建指向整个节点的引用。
+    unsafe { ptr::addr_of!((*node).first_child_).read().is_none() }
+}
+
+/// 通过裸指针读取节点项数。
+///
+/// # 安全性
+///
+/// `ptr` 必须指向当前树中仍然存活的节点。
+pub(crate) unsafe fn node_len_raw_<const M: usize, K, V>(ptr: TreeNodePtr<M, K, V>) -> usize {
+    let node = ptr.as_ptr();
+    // SAFETY: 只读取 entries_ 的计数字段，不创建指向整个节点的引用。
+    let entries = unsafe { ptr::addr_of!((*node).entries_) };
+    // SAFETY: entries 属于仍然存活的节点。
+    unsafe { OrderedArray::len_raw_(entries) }
+}
+
+/// 通过裸指针读取父节点。
+///
+/// # 安全性
+///
+/// `ptr` 必须指向当前树中仍然存活的节点。
+pub(crate) unsafe fn node_parent_raw_<const M: usize, K, V>(
+    ptr: TreeNodePtr<M, K, V>,
+) -> Option<TreeNodePtr<M, K, V>> {
+    let node = ptr.as_ptr();
+    // SAFETY: 只读取 parent_ 字段，不创建指向整个节点的引用。
+    unsafe { ptr::addr_of!((*node).parent_).read() }
+}
+
+/// 通过裸指针读取节点第 `idx` 个孩子。
+///
+/// # 安全性
+///
+/// `ptr` 必须指向当前树中仍然存活的节点，且 `idx <= node_len_raw_(ptr)`。
+pub(crate) unsafe fn child_at_raw_<const M: usize, K, V>(
+    ptr: TreeNodePtr<M, K, V>,
+    idx: usize,
+) -> Option<TreeNodePtr<M, K, V>> {
+    let node = ptr.as_ptr();
+    if idx == 0 {
+        // SAFETY: 只读取 first_child_ 字段。
+        return unsafe { ptr::addr_of!((*node).first_child_).read() };
+    }
+
+    // SAFETY: 只读取 entries_ 中第 idx - 1 项，不创建数组引用。
+    let entries = unsafe { ptr::addr_of!((*node).entries_) };
+    // SAFETY: idx - 1 由调用方保证有效。
+    let elem = unsafe { OrderedArray::elem_raw_at_(entries, idx - 1) }?;
+    // SAFETY: 只读取该项的 right_ 字段。
+    unsafe { ptr::addr_of!((*elem).1.right_).read() }
+}
+
+/// 通过裸指针取得节点第 `idx` 项的 key 与可变 value 引用。
+///
+/// 该函数只对 key 与 value 字段分别做字段级投影，不创建指向整个节点或整个
+/// `OrderedArray` 的引用。因此迭代器可以在调用者仍然持有同一节点中其他项
+/// 的 `&mut V` 时继续前进。
+///
+/// # 安全性
+///
+/// `ptr` 必须指向存活节点，`idx < node_len_raw_(ptr)`；调用方必须保证每个
+/// 数据项的 value 最多被交出一个仍在使用中的可变引用。
+pub(crate) unsafe fn entry_mut_raw_<'a, const M: usize, K, V>(
+    ptr: TreeNodePtr<M, K, V>,
+    idx: usize,
+) -> (&'a K, &'a mut V) {
+    let node = ptr.as_ptr();
+    // SAFETY: 只读取 entries_ 中第 idx 项，不创建数组引用。
+    let entries = unsafe { ptr::addr_of_mut!((*node).entries_) };
+    // SAFETY: 调用方保证 idx 有效。
+    let elem = match unsafe { OrderedArray::elem_raw_mut_at_(entries, idx) } {
+        Option::Some(elem) => elem,
+        Option::None => unreachable!("B 树节点下标应有效"),
+    };
+    // SAFETY: key 与 value 是同一项内互不重叠的字段。
+    let key = unsafe { &*ptr::addr_of!((*elem).0) };
+    // SAFETY: 调用方保证同一 value 没有其他仍在使用中的可变引用。
+    let value = unsafe { &mut *ptr::addr_of_mut!((*elem).1.value_) };
+    (key, value)
+}
+
+/// 通过裸指针返回 `child` 在 `parent` 中的孩子下标。
+///
+/// # 安全性
+///
+/// `parent` 与 `child` 必须属于同一棵仍然存活的树，且 `child` 是 `parent`
+/// 的直接孩子。
+pub(crate) unsafe fn child_index_raw_<const M: usize, K, V>(
+    parent: TreeNodePtr<M, K, V>,
+    child: TreeNodePtr<M, K, V>,
+) -> Option<usize> {
+    // SAFETY: 调用方保证 parent 存活。
+    let len = unsafe { node_len_raw_(parent) };
+    (0..=len).find(|&idx| {
+        // SAFETY: parent 存活且 idx 在 0..=len 内。
+        (unsafe { child_at_raw_(parent, idx) }) == Option::Some(child)
+    })
 }

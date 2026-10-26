@@ -33,7 +33,15 @@
 //! ```
 
 use alloc::alloc::Global;
-use core::{alloc::Allocator, borrow::Borrow, iter::FusedIterator, marker::PhantomData, mem};
+use core::{
+    alloc::Allocator,
+    borrow::Borrow,
+    cmp::Ordering,
+    iter::FusedIterator,
+    marker::PhantomData,
+    mem,
+    ops::{Bound, RangeBounds},
+};
 
 use crate::{
     comparer_::{OrdComparer, QuerySlotComparer, SlotPairKeyComparer, TrComparer},
@@ -49,6 +57,12 @@ use super::node_::{
 };
 
 use super::search_::{find_in_leaf_, find_leaf_};
+
+/// 数据位置：叶子句柄与叶子内逻辑下标。
+type DataPosition<const M: usize, K, V> = (TreeNodePtr<M, K, V>, usize);
+
+/// 一个范围的首、尾数据位置。
+type RangePositions<const M: usize, K, V> = (DataPosition<M, K, V>, DataPosition<M, K, V>);
 
 /// 非根节点的最小项数。
 #[inline]
@@ -82,6 +96,170 @@ unsafe fn data_pair_mut_<'a, K, V>(ptr: SlotPtr<(K, V)>) -> (&'a K, &'a mut V) {
     // SAFETY: 调用方保证数据槽位存活且没有别名。
     let (key, value) = unsafe { &mut *ptr.as_ptr() };
     (&*key, value)
+}
+
+/// 计算范围迭代的起始位置 `(叶子, 叶子内下标)`。
+///
+/// `Unbounded` 直接使用首叶；有界起点先按 separators 下沉到候选叶子，再用
+/// 二分查找定位第一个满足边界的位置。若位置越过叶子末尾，则跳到下一个叶子。
+fn range_start_<const M: usize, K, V, Q, TyCmp>(
+    root: Option<TreeNodePtr<M, K, V>>,
+    first_leaf: Option<TreeNodePtr<M, K, V>>,
+    start: Bound<&Q>,
+    cmp: &TyCmp,
+) -> Option<DataPosition<M, K, V>>
+where
+    Q: ?Sized,
+    TyCmp: TrComparer<K, Q>,
+{
+    let (query, inclusive) = match start {
+        Bound::Unbounded => return first_leaf.map(|leaf| (leaf, 0)),
+        Bound::Included(query) => (query, true),
+        Bound::Excluded(query) => (query, false),
+    };
+
+    let root = root?;
+    let query_cmp = QuerySlotComparer::new_(cmp);
+    let leaf_ptr = find_leaf_(root, query, &query_cmp);
+
+    // SAFETY: leaf_ptr 由树维护；调用期间树处于只读状态。
+    let leaf = unsafe { node_ref_(leaf_ptr) }.as_leaf_()?;
+    let pos = if inclusive {
+        leaf.order_arr_.lower_bound_by(query, &query_cmp)
+    } else {
+        leaf.order_arr_.upper_bound_by(query, &query_cmp)
+    };
+
+    if pos < leaf.len_() {
+        Option::Some((leaf_ptr, pos))
+    } else {
+        leaf.next_sibl_.map(|next| (next, 0))
+    }
+}
+
+/// 计算范围迭代的结束位置 `(叶子, 叶子内下标)`，即范围内最后一个元素。
+///
+/// `Unbounded` 使用尾叶的最后一个元素；有界终点先下沉到候选叶子，再按边界
+/// 语义向前回退。结果为空时返回 `None`。
+fn range_end_<const M: usize, K, V, Q, TyCmp>(
+    root: Option<TreeNodePtr<M, K, V>>,
+    last_leaf: Option<TreeNodePtr<M, K, V>>,
+    end: Bound<&Q>,
+    cmp: &TyCmp,
+) -> Option<DataPosition<M, K, V>>
+where
+    Q: ?Sized,
+    TyCmp: TrComparer<K, Q>,
+{
+    let (query, inclusive) = match end {
+        Bound::Unbounded => {
+            let leaf_ptr = last_leaf?;
+            // SAFETY: last_leaf 由树维护；调用期间树处于只读状态。
+            let leaf = unsafe { node_ref_(leaf_ptr) }.as_leaf_()?;
+            let last_idx = leaf.len_().checked_sub(1)?;
+            return Option::Some((leaf_ptr, last_idx));
+        }
+        Bound::Included(query) => (query, true),
+        Bound::Excluded(query) => (query, false),
+    };
+
+    let root = root?;
+    let query_cmp = QuerySlotComparer::new_(cmp);
+    let leaf_ptr = find_leaf_(root, query, &query_cmp);
+
+    // SAFETY: leaf_ptr 由树维护；调用期间树处于只读状态。
+    let leaf = unsafe { node_ref_(leaf_ptr) }.as_leaf_()?;
+    let pos = if inclusive {
+        leaf.order_arr_.upper_bound_by(query, &query_cmp)
+    } else {
+        leaf.order_arr_.lower_bound_by(query, &query_cmp)
+    };
+
+    if pos > 0 {
+        return Option::Some((leaf_ptr, pos - 1));
+    }
+
+    let prev_ptr = leaf.prev_sibl_?;
+    // SAFETY: prev_sibl_ 由树维护，指向仍然存活的叶子。
+    let prev = unsafe { node_ref_(prev_ptr) }.as_leaf_()?;
+    prev.len_().checked_sub(1).map(|idx| (prev_ptr, idx))
+}
+
+/// 判断 `key` 是否已经越过范围的上界。
+fn past_end_<K, Q, TyCmp>(key: &K, end: Bound<&Q>, cmp: &TyCmp) -> bool
+where
+    Q: ?Sized,
+    TyCmp: TrComparer<K, Q>,
+{
+    match end {
+        Bound::Unbounded => false,
+        Bound::Included(end) => cmp.compare(key, end) == Ordering::Greater,
+        Bound::Excluded(end) => cmp.compare(key, end) != Ordering::Less,
+    }
+}
+
+/// 判断 `key` 是否位于范围下界之前。
+fn before_start_<K, Q, TyCmp>(key: &K, start: Bound<&Q>, cmp: &TyCmp) -> bool
+where
+    Q: ?Sized,
+    TyCmp: TrComparer<K, Q>,
+{
+    match start {
+        Bound::Unbounded => false,
+        Bound::Included(start) => cmp.compare(key, start) == Ordering::Less,
+        Bound::Excluded(start) => cmp.compare(key, start) != Ordering::Greater,
+    }
+}
+
+/// 取得某个数据位置上的 key 引用。
+///
+/// # 安全性
+///
+/// `(ptr, idx)` 必须指向树中仍然存活的数据项，且返回引用的生命周期内该项
+/// 不能被删除或移动。
+unsafe fn range_key_at_<'a, const M: usize, K: 'a, V: 'a>(
+    ptr: TreeNodePtr<M, K, V>,
+    idx: usize,
+) -> Option<&'a K> {
+    // SAFETY: 调用方保证位置有效。
+    let leaf = unsafe { node_ref_(ptr) }.as_leaf_()?;
+    let (data_ptr, ()) = leaf.order_arr_.get_ref_at(idx).ok()?;
+    // SAFETY: data_ptr 指向仍然存活的数据项。
+    Option::Some(unsafe { data_pair_(*data_ptr) }.0)
+}
+
+/// 计算一个范围在树中的首、尾位置。
+///
+/// 先分别定位第一个不低于下界的元素和最后一个不高于上界的元素，再用这两个
+/// 候选元素检查它们是否真的落在范围内。树中没有任何键落在区间内时返回
+/// `None`，因此调用方不需要在迭代过程中重复比较边界。
+fn range_positions_<const M: usize, K, V, Q, TyCmp, R>(
+    root: Option<TreeNodePtr<M, K, V>>,
+    first_leaf: Option<TreeNodePtr<M, K, V>>,
+    last_leaf: Option<TreeNodePtr<M, K, V>>,
+    range: &R,
+    cmp: &TyCmp,
+) -> Option<RangePositions<M, K, V>>
+where
+    Q: ?Sized,
+    TyCmp: TrComparer<K, Q>,
+    R: RangeBounds<Q>,
+{
+    let start = range.start_bound();
+    let end = range.end_bound();
+    let front = range_start_(root, first_leaf, start, cmp)?;
+    let back = range_end_(root, last_leaf, end, cmp)?;
+
+    // SAFETY: front/back 来自当前存活树的搜索结果。
+    let front_key = unsafe { range_key_at_(front.0, front.1) }?;
+    // SAFETY: 同上。
+    let back_key = unsafe { range_key_at_(back.0, back.1) }?;
+
+    if past_end_(front_key, end, cmp) || before_start_(back_key, start, cmp) {
+        Option::None
+    } else {
+        Option::Some((front, back))
+    }
 }
 
 /// 把索引节点第 `idx` 项的分隔 key 替换为 `new_sep`，保留原来的孩子指针。
@@ -1409,6 +1587,318 @@ where
             _mark_: PhantomData,
         }
     }
+
+    /// 返回按 key 升序迭代的可变迭代器。
+    ///
+    /// 迭代器只允许修改 value；key 与树结构保持不变。与 [`Self::iter`] 一样，
+    /// 它沿叶子链前进，不需要工作栈或额外堆分配。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bplustree_cmp::BPlusTree;
+    ///
+    /// let mut tree = BPlusTree::<4, _, i32, i32>::new().unwrap();
+    /// tree.insert(1, 10);
+    /// tree.insert(2, 20);
+    /// for (_, value) in tree.iter_mut() {
+    ///     *value += 1;
+    /// }
+    /// assert_eq!(tree.get(1), Some((&1, &11)));
+    /// ```
+    pub fn iter_mut(&mut self) -> IterMut<'_, M, K, V> {
+        IterMut {
+            next_leaf_: self.first_leaf_,
+            index_: 0,
+            remaining_: self.len_,
+            _mark_: PhantomData,
+        }
+    }
+
+    /// 返回按 key 升序迭代 key 的迭代器。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bplustree_cmp::BPlusTree;
+    ///
+    /// let mut tree = BPlusTree::<4, _, i32, i32>::new().unwrap();
+    /// tree.insert(1, 10);
+    /// tree.insert(2, 20);
+    /// let keys: Vec<i32> = tree.keys().copied().collect();
+    /// assert_eq!(keys, vec![1, 2]);
+    /// ```
+    pub fn keys(&self) -> Keys<'_, M, K, V> {
+        Keys { iter_: self.iter() }
+    }
+
+    /// 返回按 key 升序迭代 value 的迭代器。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bplustree_cmp::BPlusTree;
+    ///
+    /// let mut tree = BPlusTree::<4, _, i32, i32>::new().unwrap();
+    /// tree.insert(1, 10);
+    /// tree.insert(2, 20);
+    /// let values: Vec<i32> = tree.values().copied().collect();
+    /// assert_eq!(values, vec![10, 20]);
+    /// ```
+    pub fn values(&self) -> Values<'_, M, K, V> {
+        Values { iter_: self.iter() }
+    }
+
+    /// 返回按 key 升序迭代可变 value 的迭代器。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bplustree_cmp::BPlusTree;
+    ///
+    /// let mut tree = BPlusTree::<4, _, i32, i32>::new().unwrap();
+    /// tree.insert(1, 10);
+    /// for value in tree.values_mut() {
+    ///     *value += 1;
+    /// }
+    /// assert_eq!(tree.get(1), Some((&1, &11)));
+    /// ```
+    pub fn values_mut(&mut self) -> ValuesMut<'_, M, K, V> {
+        ValuesMut {
+            iter_: self.iter_mut(),
+        }
+    }
+
+    /// 判断树中是否存在与 `query` 等价的 key。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bplustree_cmp::BPlusTree;
+    ///
+    /// let mut tree = BPlusTree::<4, _, i32, i32>::new().unwrap();
+    /// tree.insert(1, 10);
+    /// assert!(tree.contains_key(1));
+    /// assert!(!tree.contains_key(2));
+    /// ```
+    pub fn contains_key<Q>(&self, query: Q) -> bool
+    where
+        Q: Borrow<K>,
+    {
+        self.get(query).is_some()
+    }
+
+    /// 返回最小 `(K, V)` 引用，语义同 [`Self::first`]。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bplustree_cmp::BPlusTree;
+    ///
+    /// let mut tree = BPlusTree::<4, _, i32, i32>::new().unwrap();
+    /// tree.insert(2, 20);
+    /// tree.insert(1, 10);
+    /// assert_eq!(tree.first_key_value(), Some((&1, &10)));
+    /// ```
+    pub fn first_key_value(&self) -> Option<(&K, &V)> {
+        self.first()
+    }
+
+    /// 返回最大 `(K, V)` 引用，语义同 [`Self::last`]。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bplustree_cmp::BPlusTree;
+    ///
+    /// let mut tree = BPlusTree::<4, _, i32, i32>::new().unwrap();
+    /// tree.insert(2, 20);
+    /// tree.insert(1, 10);
+    /// assert_eq!(tree.last_key_value(), Some((&2, &20)));
+    /// ```
+    pub fn last_key_value(&self) -> Option<(&K, &V)> {
+        self.last()
+    }
+
+    /// 清空树中所有元素，并释放内部 arena 的 Chunk。
+    ///
+    /// 该操作只归还已有的 Chunk，不会产生新的堆分配。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bplustree_cmp::BPlusTree;
+    ///
+    /// let mut tree = BPlusTree::<4, _, i32, i32>::new().unwrap();
+    /// tree.insert(1, 10);
+    /// tree.clear();
+    /// assert!(tree.is_empty());
+    /// assert_eq!(tree.get(1), None);
+    /// ```
+    pub fn clear(&mut self) {
+        self.node_arena_.clear(&self.allocator_);
+        self.data_arena_.clear(&self.allocator_);
+        self.len_ = 0;
+        self.tree_root_ = Option::None;
+        self.first_leaf_ = Option::None;
+        self.last_leaf_ = Option::None;
+    }
+
+    /// 返回 `range` 范围内的不可变迭代器。
+    ///
+    /// 范围边界使用树自身的 Comparer 解释。起点与终点都在构造迭代器时定位，
+    /// 迭代过程只沿叶子链前进，因此不需要工作栈或额外堆分配。若范围在
+    /// Comparer 顺序下为空，或起点晚于终点，则返回空迭代器。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bplustree_cmp::BPlusTree;
+    ///
+    /// let mut tree = BPlusTree::<4, _, i32, i32>::new().unwrap();
+    /// for key in 0..10 {
+    ///     tree.insert(key, key * 10);
+    /// }
+    ///
+    /// let pairs: Vec<(i32, i32)> = tree.range(3..6).map(|(k, v)| (*k, *v)).collect();
+    /// assert_eq!(pairs, vec![(3, 30), (4, 40), (5, 50)]);
+    /// ```
+    pub fn range<R>(&self, range: R) -> RangeIter<'_, M, K, V>
+    where
+        R: RangeBounds<K>,
+    {
+        match range_positions_(
+            self.tree_root_,
+            self.first_leaf_,
+            self.last_leaf_,
+            &range,
+            &self.comparer_,
+        ) {
+            Option::Some((front, back)) => RangeIter {
+                front_: Option::Some(front),
+                back_: Option::Some(back),
+                _mark_: PhantomData,
+            },
+            Option::None => RangeIter::empty_(),
+        }
+    }
+
+    /// 返回 `range` 范围内的可变迭代器。
+    ///
+    /// 与 [`Self::range`] 相同，但迭代项为 `(&K, &mut V)`。边界为空时返回空
+    /// 迭代器。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bplustree_cmp::BPlusTree;
+    ///
+    /// let mut tree = BPlusTree::<4, _, i32, i32>::new().unwrap();
+    /// for key in 0..10 {
+    ///     tree.insert(key, key * 10);
+    /// }
+    /// for (_, value) in tree.range_mut(3..6) {
+    ///     *value += 1;
+    /// }
+    /// assert_eq!(tree.get(3), Some((&3, &31)));
+    /// assert_eq!(tree.get(6), Some((&6, &60)));
+    /// ```
+    pub fn range_mut<R>(&mut self, range: R) -> RangeIterMut<'_, M, K, V>
+    where
+        R: RangeBounds<K>,
+    {
+        match range_positions_(
+            self.tree_root_,
+            self.first_leaf_,
+            self.last_leaf_,
+            &range,
+            &self.comparer_,
+        ) {
+            Option::Some((front, back)) => RangeIterMut {
+                front_: Option::Some(front),
+                back_: Option::Some(back),
+                _mark_: PhantomData,
+            },
+            Option::None => RangeIterMut::empty_(),
+        }
+    }
+
+    /// 使用异构 Comparer 返回 `range` 范围内的不可变迭代器。
+    ///
+    /// `cmp` 必须在 `K ↔ K` 上与树的存储 Comparer 一致。边界类型 `Q` 可以与
+    /// `K` 不同，例如树中保存 `String` 时用 `&str` 作为边界。空范围返回空
+    /// 迭代器。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bplustree_cmp::BPlusTree;
+    ///
+    /// let mut tree = BPlusTree::<4, _, String, i32>::new().unwrap();
+    /// for (key, value) in [("a", 1), ("b", 2), ("c", 3)] {
+    ///     tree.insert(key.to_string(), value);
+    /// }
+    ///
+    /// let keys: Vec<&str> = tree
+    ///     .range_with_comparer("a"..="b", &|a: &String, b: &&str| a.as_str().cmp(*b))
+    ///     .map(|(key, _)| key.as_str())
+    ///     .collect();
+    /// assert_eq!(keys, vec!["a", "b"]);
+    /// ```
+    pub fn range_with_comparer<'a, Q, TyCmp, R>(
+        &'a self,
+        range: R,
+        cmp: &TyCmp,
+    ) -> RangeIter<'a, M, K, V>
+    where
+        Q: ?Sized,
+        TyCmp: TrComparer<K, Q>,
+        R: RangeBounds<Q>,
+    {
+        match range_positions_(
+            self.tree_root_,
+            self.first_leaf_,
+            self.last_leaf_,
+            &range,
+            cmp,
+        ) {
+            Option::Some((front, back)) => RangeIter {
+                front_: Option::Some(front),
+                back_: Option::Some(back),
+                _mark_: PhantomData,
+            },
+            Option::None => RangeIter::empty_(),
+        }
+    }
+
+    /// 使用异构 Comparer 返回 `range` 范围内的可变迭代器。
+    ///
+    /// `cmp` 必须在 `K ↔ K` 上与树的存储 Comparer 一致。空范围返回空迭代器。
+    pub fn range_mut_with_comparer<'a, Q, TyCmp, R>(
+        &'a mut self,
+        range: R,
+        cmp: &TyCmp,
+    ) -> RangeIterMut<'a, M, K, V>
+    where
+        Q: ?Sized,
+        TyCmp: TrComparer<K, Q>,
+        R: RangeBounds<Q>,
+    {
+        match range_positions_(
+            self.tree_root_,
+            self.first_leaf_,
+            self.last_leaf_,
+            &range,
+            cmp,
+        ) {
+            Option::Some((front, back)) => RangeIterMut {
+                front_: Option::Some(front),
+                back_: Option::Some(back),
+                _mark_: PhantomData,
+            },
+            Option::None => RangeIterMut::empty_(),
+        }
+    }
 }
 
 impl<const M: usize, K, V> BPlusTree<M, OrdComparer<K>, K, V, Global>
@@ -1863,6 +2353,284 @@ impl<const M: usize, K, V> ExactSizeIterator for TreeIter<'_, M, K, V> {}
 
 impl<const M: usize, K, V> FusedIterator for TreeIter<'_, M, K, V> {}
 
+/// 返回叶子链中 `(leaf_ptr, idx)` 的下一个数据位置。
+fn next_position_<const M: usize, K, V>(
+    leaf_ptr: TreeNodePtr<M, K, V>,
+    idx: usize,
+) -> Option<DataPosition<M, K, V>> {
+    // SAFETY: leaf_ptr 由树维护，迭代器借用树保证叶子存活。
+    let leaf = unsafe { node_ref_(leaf_ptr) }.as_leaf_()?;
+    if idx + 1 < leaf.len_() {
+        Option::Some((leaf_ptr, idx + 1))
+    } else {
+        leaf.next_sibl_.map(|next| (next, 0))
+    }
+}
+
+/// 返回叶子链中 `(leaf_ptr, idx)` 的前一个数据位置。
+fn prev_position_<const M: usize, K, V>(
+    leaf_ptr: TreeNodePtr<M, K, V>,
+    idx: usize,
+) -> Option<DataPosition<M, K, V>> {
+    if idx > 0 {
+        return Option::Some((leaf_ptr, idx - 1));
+    }
+
+    // SAFETY: leaf_ptr 由树维护，迭代器借用树保证叶子存活。
+    let leaf = unsafe { node_ref_(leaf_ptr) }.as_leaf_()?;
+    let prev_ptr = leaf.prev_sibl_?;
+    // SAFETY: prev_sibl_ 指向仍然存活的叶子。
+    let prev = unsafe { node_ref_(prev_ptr) }.as_leaf_()?;
+    Some((prev_ptr, prev.len_().checked_sub(1)?))
+}
+
+/// 子范围不可变迭代器。
+///
+/// 由 [`BPlusTree::range`] / [`BPlusTree::range_with_comparer`] 创建。范围
+/// 首尾在构造时已经定位，迭代只沿叶子链移动，不需要工作栈或堆分配。
+pub struct RangeIter<'a, const M: usize, K, V = ()> {
+    /// 下一个从前端访问的位置。
+    front_: Option<DataPosition<M, K, V>>,
+    /// 下一个从后端访问的位置。
+    back_: Option<DataPosition<M, K, V>>,
+    _mark_: PhantomData<&'a (K, V)>,
+}
+
+impl<'a, const M: usize, K, V> RangeIter<'a, M, K, V> {
+    /// 创建一个空范围迭代器。
+    fn empty_() -> Self {
+        RangeIter {
+            front_: Option::None,
+            back_: Option::None,
+            _mark_: PhantomData,
+        }
+    }
+}
+
+impl<'a, const M: usize, K, V> Iterator for RangeIter<'a, M, K, V> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (leaf_ptr, idx) = self.front_?;
+
+        // SAFETY: 位置由树维护；迭代器借用树，叶子和数据在 'a 内保持存活。
+        let leaf = unsafe { node_ref_(leaf_ptr) }.as_leaf_()?;
+        let (data_ptr, ()) = leaf.order_arr_.get_ref_at(idx).ok()?;
+        // SAFETY: data_ptr 指向 'a 内仍然存活的数据。
+        let pair = unsafe { data_pair_(*data_ptr) };
+
+        if self.front_ == self.back_ {
+            self.front_ = Option::None;
+            self.back_ = Option::None;
+        } else {
+            self.front_ = next_position_(leaf_ptr, idx);
+        }
+        Option::Some(pair)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match (self.front_, self.back_) {
+            (Option::None, _) => (0, Option::Some(0)),
+            (Option::Some(front), Option::Some(back)) if front == back => (1, Option::Some(1)),
+            _ => (1, Option::None),
+        }
+    }
+}
+
+impl<const M: usize, K, V> DoubleEndedIterator for RangeIter<'_, M, K, V> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let (leaf_ptr, idx) = self.back_?;
+
+        // SAFETY: 位置由树维护；迭代器借用树，叶子和数据在 'a 内保持存活。
+        let leaf = unsafe { node_ref_(leaf_ptr) }.as_leaf_()?;
+        let (data_ptr, ()) = leaf.order_arr_.get_ref_at(idx).ok()?;
+        // SAFETY: data_ptr 指向 'a 内仍然存活的数据。
+        let pair = unsafe { data_pair_(*data_ptr) };
+
+        if self.front_ == self.back_ {
+            self.front_ = Option::None;
+            self.back_ = Option::None;
+        } else {
+            self.back_ = prev_position_(leaf_ptr, idx);
+        }
+        Option::Some(pair)
+    }
+}
+
+impl<const M: usize, K, V> FusedIterator for RangeIter<'_, M, K, V> {}
+
+/// 子范围可变迭代器。
+///
+/// 由 [`BPlusTree::range_mut`] / [`BPlusTree::range_mut_with_comparer`] 创建。
+/// 只能修改 value，key 与树结构保持不变。
+pub struct RangeIterMut<'a, const M: usize, K, V = ()> {
+    /// 下一个从前端访问的位置。
+    front_: Option<DataPosition<M, K, V>>,
+    /// 范围最后一个位置；前端越过它时迭代结束。
+    back_: Option<DataPosition<M, K, V>>,
+    _mark_: PhantomData<&'a mut (K, V)>,
+}
+
+impl<'a, const M: usize, K, V> RangeIterMut<'a, M, K, V> {
+    /// 创建一个空范围可变迭代器。
+    fn empty_() -> Self {
+        RangeIterMut {
+            front_: Option::None,
+            back_: Option::None,
+            _mark_: PhantomData,
+        }
+    }
+}
+
+impl<'a, const M: usize, K, V> Iterator for RangeIterMut<'a, M, K, V> {
+    type Item = (&'a K, &'a mut V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (leaf_ptr, idx) = self.front_?;
+
+        // SAFETY: 位置由树维护；可变迭代器独占树，叶子和数据在 'a 内保持存活。
+        let leaf = unsafe { node_ref_(leaf_ptr) }.as_leaf_()?;
+        let (data_ptr, ()) = leaf.order_arr_.get_ref_at(idx).ok()?;
+        // SAFETY: 每个数据项只会被交出一次，且 &mut 树保证独占访问。
+        let pair = unsafe { data_pair_mut_(*data_ptr) };
+
+        if self.front_ == self.back_ {
+            self.front_ = Option::None;
+            self.back_ = Option::None;
+        } else {
+            self.front_ = next_position_(leaf_ptr, idx);
+        }
+        Option::Some(pair)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match (self.front_, self.back_) {
+            (Option::None, _) => (0, Option::Some(0)),
+            (Option::Some(front), Option::Some(back)) if front == back => (1, Option::Some(1)),
+            _ => (1, Option::None),
+        }
+    }
+}
+
+impl<const M: usize, K, V> FusedIterator for RangeIterMut<'_, M, K, V> {}
+
+/// 按 key 升序迭代 [`BPlusTree`] 的可变迭代器。
+///
+/// 只能修改 value；key 与树结构保持不变。迭代沿叶子链前进，不进行额外堆分配。
+pub struct IterMut<'a, const M: usize, K, V = ()> {
+    next_leaf_: Option<TreeNodePtr<M, K, V>>,
+    index_: usize,
+    remaining_: usize,
+    _mark_: PhantomData<&'a mut (K, V)>,
+}
+
+impl<'a, const M: usize, K, V> Iterator for IterMut<'a, M, K, V> {
+    type Item = (&'a K, &'a mut V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let leaf_ptr = self.next_leaf_?;
+
+            // SAFETY: 迭代器借用树，叶子和数据在 'a 内保持存活。
+            let node = unsafe { node_ref_(leaf_ptr) };
+            let Option::Some(leaf) = node.as_leaf_() else {
+                self.next_leaf_ = Option::None;
+                return Option::None;
+            };
+
+            if self.index_ < leaf.order_arr_.len() {
+                match leaf.order_arr_.get_ref_at(self.index_) {
+                    Result::Ok((data_ptr, ())) => {
+                        self.index_ += 1;
+                        self.remaining_ -= 1;
+                        // SAFETY: 每个数据项只会被交出一次，且 &mut 树保证独占访问。
+                        return Option::Some(unsafe { data_pair_mut_(*data_ptr) });
+                    }
+                    Result::Err(_) => {
+                        self.index_ = 0;
+                        self.next_leaf_ = leaf.next_sibl_;
+                        continue;
+                    }
+                }
+            }
+
+            self.index_ = 0;
+            self.next_leaf_ = leaf.next_sibl_;
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining_, Option::Some(self.remaining_))
+    }
+}
+
+impl<const M: usize, K, V> ExactSizeIterator for IterMut<'_, M, K, V> {}
+
+impl<const M: usize, K, V> FusedIterator for IterMut<'_, M, K, V> {}
+
+/// 按 key 升序迭代 [`BPlusTree`] 的 key。
+pub struct Keys<'a, const M: usize, K, V = ()> {
+    iter_: TreeIter<'a, M, K, V>,
+}
+
+impl<'a, const M: usize, K, V> Iterator for Keys<'a, M, K, V> {
+    type Item = &'a K;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter_.next().map(|(key, _)| key)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter_.size_hint()
+    }
+}
+
+impl<const M: usize, K, V> ExactSizeIterator for Keys<'_, M, K, V> {}
+
+impl<const M: usize, K, V> FusedIterator for Keys<'_, M, K, V> {}
+
+/// 按 key 升序迭代 [`BPlusTree`] 的 value。
+pub struct Values<'a, const M: usize, K, V = ()> {
+    iter_: TreeIter<'a, M, K, V>,
+}
+
+impl<'a, const M: usize, K, V> Iterator for Values<'a, M, K, V> {
+    type Item = &'a V;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter_.next().map(|(_, value)| value)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter_.size_hint()
+    }
+}
+
+impl<const M: usize, K, V> ExactSizeIterator for Values<'_, M, K, V> {}
+
+impl<const M: usize, K, V> FusedIterator for Values<'_, M, K, V> {}
+
+/// 按 key 升序迭代 [`BPlusTree`] 的可变 value。
+pub struct ValuesMut<'a, const M: usize, K, V = ()> {
+    iter_: IterMut<'a, M, K, V>,
+}
+
+impl<'a, const M: usize, K, V> Iterator for ValuesMut<'a, M, K, V> {
+    type Item = &'a mut V;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter_.next().map(|(_, value)| value)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter_.size_hint()
+    }
+}
+
+impl<const M: usize, K, V> ExactSizeIterator for ValuesMut<'_, M, K, V> {}
+
+impl<const M: usize, K, V> FusedIterator for ValuesMut<'_, M, K, V> {}
+
 /// 对 `&BPlusTree` 的迭代器。
 impl<'a, const M: usize, C, K, V, A> IntoIterator for &'a BPlusTree<M, C, K, V, A>
 where
@@ -1874,6 +2642,20 @@ where
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
+    }
+}
+
+/// 对 `&mut BPlusTree` 的迭代器。
+impl<'a, const M: usize, C, K, V, A> IntoIterator for &'a mut BPlusTree<M, C, K, V, A>
+where
+    C: TrComparer<K>,
+    A: Allocator,
+{
+    type Item = (&'a K, &'a mut V);
+    type IntoIter = IterMut<'a, M, K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
     }
 }
 

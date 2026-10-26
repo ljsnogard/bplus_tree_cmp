@@ -34,7 +34,7 @@
 //! ```
 
 use alloc::alloc::Global;
-use core::{alloc::Allocator, borrow::Borrow, mem};
+use core::{alloc::Allocator, borrow::Borrow, mem, ops::RangeBounds};
 
 use crate::{
     comparer_::{OrdComparer, TrComparer},
@@ -46,9 +46,9 @@ use super::node_::{Node, TreeNodePtr, entry_mut_, entry_ref_};
 
 use super::{
     insert_::insert_pair_into_tree_,
-    iter_::TreeIter,
+    iter_::{IterMut, Keys, RangeIter, RangeIterMut, TreeIter, Values, ValuesMut},
     remove_::remove_entry_from_tree_,
-    search_::{find_entry_, first_entry_, last_entry_},
+    search_::{find_entry_, first_entry_, last_entry_, range_positions_},
 };
 
 /// 删除核心逻辑。
@@ -459,6 +459,244 @@ where
     pub fn iter(&self) -> TreeIter<'_, M, K, V> {
         TreeIter::new_(self.tree_root_, self.len_)
     }
+
+    /// 返回按 key 升序迭代的可变迭代器。
+    ///
+    /// 只能修改 value；key 与树结构保持不变。迭代沿父指针计算中序后继，
+    /// 不需要工作栈或额外堆分配。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bplustree_cmp::BTree;
+    ///
+    /// let mut tree = BTree::<4, _, i32, i32>::new().unwrap();
+    /// tree.insert(1, 10);
+    /// tree.insert(2, 20);
+    /// for (_, value) in tree.iter_mut() {
+    ///     *value += 1;
+    /// }
+    /// assert_eq!(tree.get(1), Some((&1, &11)));
+    /// ```
+    pub fn iter_mut(&mut self) -> IterMut<'_, M, K, V> {
+        IterMut::new_(self.tree_root_, self.len_)
+    }
+
+    /// 返回按 key 升序迭代 key 的迭代器。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bplustree_cmp::BTree;
+    ///
+    /// let mut tree = BTree::<4, _, i32, i32>::new().unwrap();
+    /// tree.insert(1, 10);
+    /// tree.insert(2, 20);
+    /// let keys: Vec<i32> = tree.keys().copied().collect();
+    /// assert_eq!(keys, vec![1, 2]);
+    /// ```
+    pub fn keys(&self) -> Keys<'_, M, K, V> {
+        Keys { iter_: self.iter() }
+    }
+
+    /// 返回按 key 升序迭代 value 的迭代器。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bplustree_cmp::BTree;
+    ///
+    /// let mut tree = BTree::<4, _, i32, i32>::new().unwrap();
+    /// tree.insert(1, 10);
+    /// tree.insert(2, 20);
+    /// let values: Vec<i32> = tree.values().copied().collect();
+    /// assert_eq!(values, vec![10, 20]);
+    /// ```
+    pub fn values(&self) -> Values<'_, M, K, V> {
+        Values { iter_: self.iter() }
+    }
+
+    /// 返回按 key 升序迭代可变 value 的迭代器。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bplustree_cmp::BTree;
+    ///
+    /// let mut tree = BTree::<4, _, i32, i32>::new().unwrap();
+    /// tree.insert(1, 10);
+    /// for value in tree.values_mut() {
+    ///     *value += 1;
+    /// }
+    /// assert_eq!(tree.get(1), Some((&1, &11)));
+    /// ```
+    pub fn values_mut(&mut self) -> ValuesMut<'_, M, K, V> {
+        ValuesMut {
+            iter_: self.iter_mut(),
+        }
+    }
+
+    /// 判断树中是否存在与 `query` 等价的 key。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bplustree_cmp::BTree;
+    ///
+    /// let mut tree = BTree::<4, _, i32, i32>::new().unwrap();
+    /// tree.insert(1, 10);
+    /// assert!(tree.contains_key(1));
+    /// assert!(!tree.contains_key(2));
+    /// ```
+    pub fn contains_key<Q>(&self, query: Q) -> bool
+    where
+        Q: Borrow<K>,
+    {
+        self.get(query).is_some()
+    }
+
+    /// 返回最小 `(K, V)` 引用，语义同 [`Self::first`]。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bplustree_cmp::BTree;
+    ///
+    /// let mut tree = BTree::<4, _, i32, i32>::new().unwrap();
+    /// tree.insert(2, 20);
+    /// tree.insert(1, 10);
+    /// assert_eq!(tree.first_key_value(), Some((&1, &10)));
+    /// ```
+    pub fn first_key_value(&self) -> Option<(&K, &V)> {
+        self.first()
+    }
+
+    /// 返回最大 `(K, V)` 引用，语义同 [`Self::last`]。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bplustree_cmp::BTree;
+    ///
+    /// let mut tree = BTree::<4, _, i32, i32>::new().unwrap();
+    /// tree.insert(2, 20);
+    /// tree.insert(1, 10);
+    /// assert_eq!(tree.last_key_value(), Some((&2, &20)));
+    /// ```
+    pub fn last_key_value(&self) -> Option<(&K, &V)> {
+        self.last()
+    }
+
+    /// 清空树中所有元素，并释放内部 arena 的 Chunk。
+    ///
+    /// 该操作只归还已有的 Chunk，不会产生新的堆分配。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bplustree_cmp::BTree;
+    ///
+    /// let mut tree = BTree::<4, _, i32, i32>::new().unwrap();
+    /// tree.insert(1, 10);
+    /// tree.clear();
+    /// assert!(tree.is_empty());
+    /// assert_eq!(tree.get(1), None);
+    /// ```
+    pub fn clear(&mut self) {
+        self.node_arena_.clear(&self.allocator_);
+        self.len_ = 0;
+        self.tree_root_ = Option::None;
+    }
+
+    /// 返回 `range` 范围内的不可变迭代器。
+    ///
+    /// 范围边界使用树自身的 Comparer 解释。首尾位置在构造迭代器时一次定位，
+    /// 之后沿父指针前进，不需要工作栈或额外堆分配。若范围在 Comparer 顺序下
+    /// 为空，或起点晚于终点，则返回空迭代器。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bplustree_cmp::BTree;
+    ///
+    /// let mut tree = BTree::<4, _, i32, i32>::new().unwrap();
+    /// for key in 0..10 {
+    ///     tree.insert(key, key * 10);
+    /// }
+    ///
+    /// let pairs: Vec<(i32, i32)> = tree.range(3..6).map(|(k, v)| (*k, *v)).collect();
+    /// assert_eq!(pairs, vec![(3, 30), (4, 40), (5, 50)]);
+    /// ```
+    pub fn range<R>(&self, range: R) -> RangeIter<'_, M, K, V>
+    where
+        R: RangeBounds<K>,
+    {
+        let positions = range_positions_(self.tree_root_, &range, &self.comparer_);
+        RangeIter::new_(positions)
+    }
+
+    /// 返回 `range` 范围内的可变迭代器。
+    ///
+    /// 与 [`Self::range`] 相同，但迭代项为 `(&K, &mut V)`。边界为空时返回空
+    /// 迭代器。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bplustree_cmp::BTree;
+    ///
+    /// let mut tree = BTree::<4, _, i32, i32>::new().unwrap();
+    /// for key in 0..10 {
+    ///     tree.insert(key, key * 10);
+    /// }
+    /// for (_, value) in tree.range_mut(3..6) {
+    ///     *value += 1;
+    /// }
+    /// assert_eq!(tree.get(3), Some((&3, &31)));
+    /// assert_eq!(tree.get(6), Some((&6, &60)));
+    /// ```
+    pub fn range_mut<R>(&mut self, range: R) -> RangeIterMut<'_, M, K, V>
+    where
+        R: RangeBounds<K>,
+    {
+        let positions = range_positions_(self.tree_root_, &range, &self.comparer_);
+        RangeIterMut::new_(positions)
+    }
+
+    /// 使用异构 Comparer 返回 `range` 范围内的不可变迭代器。
+    ///
+    /// `cmp` 必须在 `K ↔ K` 上与树的存储 Comparer 一致。边界类型 `Q` 可以与
+    /// `K` 不同。空范围返回空迭代器。
+    pub fn range_with_comparer<'a, Q, TyCmp, R>(
+        &'a self,
+        range: R,
+        cmp: &TyCmp,
+    ) -> RangeIter<'a, M, K, V>
+    where
+        Q: ?Sized,
+        TyCmp: TrComparer<K, Q>,
+        R: RangeBounds<Q>,
+    {
+        let positions = range_positions_(self.tree_root_, &range, cmp);
+        RangeIter::new_(positions)
+    }
+
+    /// 使用异构 Comparer 返回 `range` 范围内的可变迭代器。
+    ///
+    /// `cmp` 必须在 `K ↔ K` 上与树的存储 Comparer 一致。空范围返回空迭代器。
+    pub fn range_mut_with_comparer<'a, Q, TyCmp, R>(
+        &'a mut self,
+        range: R,
+        cmp: &TyCmp,
+    ) -> RangeIterMut<'a, M, K, V>
+    where
+        Q: ?Sized,
+        TyCmp: TrComparer<K, Q>,
+        R: RangeBounds<Q>,
+    {
+        let positions = range_positions_(self.tree_root_, &range, cmp);
+        RangeIterMut::new_(positions)
+    }
 }
 
 impl<const M: usize, K, V> BTree<M, OrdComparer<K>, K, V, Global>
@@ -751,6 +989,20 @@ where
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
+    }
+}
+
+/// 对 `&mut BTree` 的迭代器。
+impl<'a, const M: usize, C, K, V, A> IntoIterator for &'a mut BTree<M, C, K, V, A>
+where
+    C: TrComparer<K>,
+    A: Allocator,
+{
+    type Item = (&'a K, &'a mut V);
+    type IntoIter = IterMut<'a, M, K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
     }
 }
 

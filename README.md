@@ -23,6 +23,7 @@ BPlusTreeCmp 的核心思想很简单：
 * **数据、索引结构与排序关系彼此解耦**
 * **SlabList 对 B+ Tree 与 B Tree 隐藏了具体的存储实现**
 * **两棵树都公开 `A = Global` allocator 泛型参数，SlabList 不要求 allocator `Clone`**
+* **提供 `range` / `range_mut` / `iter_mut` / `keys` / `values_mut` 等与 `BTreeMap` 对应的迭代 API，且不引入临时堆分配**
 
 ---
 
@@ -46,7 +47,7 @@ src/
     ├── search_.rs     查找与首尾
     ├── insert_.rs     插入、分裂与上移
     ├── remove_.rs     删除、借位、合并与根收缩
-    └── iter_.rs       父指针中序迭代器
+    └── iter_.rs       父指针中序/范围迭代器与字段级可变访问
 ```
 
 `Comparer`、`SlabList` 和 `OrderedArray` 不依赖任何一棵树；B+ Tree 与 B Tree
@@ -285,12 +286,25 @@ struct NodeValue<const M: usize, K, V> {
   递归返回后按“先借位、后合并”的顺序修复下溢，最后收缩空 root。
 - 节点全部来自 `SlabList<Node<M, K, V>>`，没有逐节点堆分配。
 
-## 迭代
+## 迭代与范围查询
 
 B 树的数据分散在所有层级，无法像 B+ 树一样沿叶子链迭代。`BTree::iter()` 利用
 节点中的父指针计算中序后继：内部项的后继是右子树最小项，叶子最后一项则沿父链
 找到第一个“当前孩子不是最后一个孩子”的祖先。迭代器只保存当前 `(节点, 下标)`，
 不使用工作栈，也不做任何堆分配。
+
+`range` / `range_mut` 在构造迭代器时各用一次 `O(log n)` 搜索定位首、尾位置，之后
+只保存这两个位置：
+
+- B+ Tree 沿 `prev` / `next` 叶子链移动；
+- B Tree 沿父指针计算中序前驱/后继；
+- 不可变范围迭代器支持 `DoubleEndedIterator`（可以 `.rev()`）；
+- 可变迭代器只交出 `&mut V`，key 与树结构保持不变；
+- 所有迭代器状态都是固定大小的游标，不使用 `Vec`、`Box` 或工作栈。
+
+因此新增的范围与可变迭代 API 不会为每次迭代引入临时堆分配。B 树的可变迭代器
+使用字段级裸指针投影，只对目标项的 `value_` 字段建立 `&mut V`，避免与同一节点
+中先前交出的其他 `&mut V` 产生别名。
 
 ## 与 B+ Tree 的公开 API 对应关系
 
@@ -298,13 +312,17 @@ B 树的数据分散在所有层级，无法像 B+ 树一样沿叶子链迭代�
 | --- | --- |
 | `BPlusTree::<M, C, K, V, A = Global>` | `BTree::<M, C, K, V, A = Global>` |
 | `ConflictInfo` / `TreeIter` | `BTreeConflictInfo` / `BTreeIter` |
+| `IterMut` / `RangeIter` / `RangeIterMut` / `Keys` / `Values` / `ValuesMut` | `BTreeIterMut` / `BTreeRangeIter` / `BTreeRangeIterMut` / `BTreeKeys` / `BTreeValues` / `BTreeValuesMut` |
 | `new` / `new_in` / `degree` / `len` / `is_empty` / `comparer` | 同名 |
 | `with_comparer` / `with_comparer_in` | 同名 |
 | `first` / `last` | 同名，但复杂度和实现不同 |
 | `get` / `get_mut` / `get_with_comparer` / `get_mut_with_comparer` | 同名 |
 | `try_insert` / `try_insert_with_comparer` / `insert` | 同名 |
 | `remove` / `remove_entry` / `remove_with_comparer` / `remove_entry_with_comparer` | 同名 |
-| `iter` / `from_iter_with_comparer` / `from_iter_with_comparer_in` / `from_iter_in` / `Extend` / `FromIterator` | 同名 |
+| `iter` / `iter_mut` / `keys` / `values` / `values_mut` / `range` / `range_mut` | 同名 |
+| `range_with_comparer` / `range_mut_with_comparer` | 同名 |
+| `contains_key` / `first_key_value` / `last_key_value` / `clear` | 同名 |
+| `from_iter_with_comparer` / `from_iter_with_comparer_in` / `from_iter_in` / `Extend` / `FromIterator` | 同名 |
 
 `M` 在两棵树中都表示“每个节点最多保存的项数”：B+ 树的索引节点孩子数最多为
 `M`，B 树的内部节点孩子数最多为 `M + 1`。
@@ -401,6 +419,20 @@ for (key, value) in &tree {
     println!("{key}: {value}");
 }
 
+// 范围查询：不可变与可变迭代器
+for (key, value) in tree.range(10..20) {
+    println!("{key}: {value}");
+}
+for (_, value) in tree.range_mut(10..20) {
+    *value += 1;
+}
+
+// key/value 视图与可变迭代
+let keys: Vec<u64> = tree.keys().copied().collect();
+for value in tree.values_mut() {
+    *value += 1;
+}
+
 // 删除：remove 返回 value，remove_entry 返回 (K, V)
 let value = tree.remove(1);
 let entry = tree.remove_entry(2);
@@ -412,9 +444,14 @@ let tree = BPlusTree::<4, _, u64, &str>::from_iter_with_comparer(
 ).unwrap();
 ```
 
-`try_insert_with_comparer` / `get_with_comparer` / `remove_with_comparer` 接受一个
-异构 Comparer，因此查询对象可以是 `&str`、`u64` 等与 `K` 不同的类型。`factory`
-只在确认没有等价 key 后调用一次，避免为一次失败的插入构造临时 `K`。
+`try_insert_with_comparer` / `get_with_comparer` / `remove_with_comparer` /
+`range_with_comparer` 接受一个异构 Comparer，因此查询对象或范围边界可以是
+`&str`、`u64` 等与 `K` 不同的类型。`factory` 只在确认没有等价 key 后调用一次，
+避免为一次失败的插入构造临时 `K`。
+
+范围边界遵循树自身的 Comparer 顺序：反向 Comparer 下 `range(20..10)` 表示
+Comparer 意义上的 `20 <= key < 10`，与 `i32` 的自然顺序无关。若边界顺序在
+Comparer 下已经为空（例如普通 Comparer 下的 `20..10`），则返回空迭代器。
 
 构造器遵循 `std::collections` 的命名：
 
@@ -595,6 +632,8 @@ BENCH_N=500000 BENCH_SAMPLES=7 cargo bench --bench btreemap_compare
 * `first` / `last` / `get` / `get_mut` / `get_with_comparer` / `get_mut_with_comparer`
 * `try_insert` / `try_insert_with_comparer` / `insert`
 * `remove` / `remove_entry` / `remove_with_comparer` / `remove_entry_with_comparer`
+* `iter_mut` / `range` / `range_mut` / `range_with_comparer` / `range_mut_with_comparer`
+* `keys` / `values` / `values_mut` / `contains_key` / `first_key_value` / `last_key_value` / `clear`
 * `new` / `new_in` / `with_comparer` / `with_comparer_in`
 * `from_iter_in` / `from_iter_with_comparer` / `from_iter_with_comparer_in`
 * `FromIterator` / `Extend` / 自定义 allocator
@@ -610,8 +649,9 @@ BENCH_N=500000 BENCH_SAMPLES=7 cargo bench --bench btreemap_compare
 > **一种 Comparer-first、轻量索引、数据与排序关系解耦的 B+ Tree / B Tree 实现。**
 
 它仍然不是标准库 `BTreeMap` 的完全替代品：allocator 已经暴露为两棵树的泛型参数，
-但单 Chunk 大小等 SlabList 配置尚未暴露；此外也尚未提供 `Entry` API、范围查询和
-owned iterator 等更高层功能。
+但单 Chunk 大小等 SlabList 配置尚未暴露；此外也尚未提供 `Entry` API、owned
+iterator、`split_off` / `append` / `retain` / `pop_first` / `pop_last` 等更高层功能。范围查询、可变迭代与 key/value
+视图已经提供，并且都保持零临时堆分配。
 
 ---
 

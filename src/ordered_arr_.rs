@@ -154,6 +154,60 @@ impl<const N: usize, K, V> OrderedArray<N, K, V> {
         }
     }
 
+    /// 通过裸指针读取当前元素数量。
+    ///
+    /// # 安全性
+    ///
+    /// `this` 必须指向一个仍然存活的 `OrderedArray`，且在读取期间不能有
+    /// 对该数组的失效引用通过 `this` 被创建。
+    ///
+    /// 该函数只读取 `count_` 字段，不创建指向整个数组的引用，因此可以在
+    /// 已经向调用者交出数组中某个 `V` 的可变引用后继续使用。
+    pub(crate) unsafe fn len_raw_(this: *const Self) -> usize {
+        // SAFETY: 调用方保证 this 指向存活数组；只读取 count_ 字段。
+        unsafe { ptr::addr_of!((*this).count_).read() }
+    }
+
+    /// 通过裸指针取得逻辑下标 `i` 对应元素的裸指针。
+    ///
+    /// # 安全性
+    ///
+    /// `this` 必须指向一个仍然存活的 `OrderedArray`；返回的指针只在数组
+    /// 元素未被移除且数组仍然存活时有效。调用方在解引用时还必须保证满足
+    /// Rust 的别名规则。
+    pub(crate) unsafe fn elem_raw_at_(this: *const Self, i: usize) -> Option<*const (K, V)> {
+        // SAFETY: 调用方保证 this 指向存活数组。
+        let count = unsafe { Self::len_raw_(this) };
+        if i >= count {
+            return Option::None;
+        }
+
+        // SAFETY: 只读取 order_ 中的槽位，不创建数组引用。
+        let physical = unsafe { ptr::addr_of!((*this).order_).cast::<usize>().add(i).read() };
+        // SAFETY: elems_ 与 (K, V) 布局兼容，physical 由 order_ 保证在 0..N 内。
+        let elems = unsafe { ptr::addr_of!((*this).elems_).cast::<(K, V)>() };
+        Option::Some(unsafe { elems.add(physical) })
+    }
+
+    /// 通过裸指针取得逻辑下标 `i` 对应元素的可写裸指针。
+    ///
+    /// # 安全性
+    ///
+    /// 与 [`Self::elem_raw_at_`] 相同；此外调用方必须拥有该元素的独占访问权。
+    pub(crate) unsafe fn elem_raw_mut_at_(this: *mut Self, i: usize) -> Option<*mut (K, V)> {
+        // SAFETY: 调用方保证 this 指向存活数组。
+        let count = unsafe { Self::len_raw_(this) };
+        if i >= count {
+            return Option::None;
+        }
+
+        // SAFETY: 只读取 order_ 中的槽位，不创建数组引用。
+        let physical = unsafe { ptr::addr_of!((*this).order_).cast::<usize>().add(i).read() };
+        // SAFETY: elems_ 与 (K, V) 布局兼容，physical 由 order_ 保证在 0..N 内。
+        let elems = unsafe { ptr::addr_of_mut!((*this).elems_).cast::<(K, V)>() };
+        Option::Some(unsafe { elems.add(physical) })
+    }
+
     pub fn first(&self) -> Option<(&K, &V)> {
         self.get_ref_at(0usize).ok()
     }
