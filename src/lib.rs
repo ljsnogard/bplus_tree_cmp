@@ -12,7 +12,8 @@
 //! 模块中；两种树的节点定义分别位于各自模块的 `node_` 子模块。
 //!
 //! `SlabList`、`OrderedArray`、`SlotPtr` 等保持 crate 内部；两种树都暴露最后
-//! 一个泛型参数 `A = Global`，用于指定内置 `SlabList` 的底层 allocator，
+//! 一个泛型参数 `Cfg: TrConfig`，用于同时指定内置 `SlabList` 的单 Chunk 大小
+//! 和底层 allocator。默认配置为 [`DefaultSlabConfig`]（64 KiB + `Global`），
 //! allocator 实例由树自己持有。树构造失败时返回公开的 [`TreeError`]。
 //!
 //! 两种树都提供与 `BTreeMap` 对应的范围与可变迭代 API：`range` / `range_mut`、
@@ -44,4 +45,8 @@ pub use btree::{
     Values as BTreeValues, ValuesMut as BTreeValuesMut,
 };
 pub use comparer_::{OrdComparer, TrComparer};
+pub use slab_list_::{
+    CHUNK_SIZE_1K, CHUNK_SIZE_2K, CHUNK_SIZE_4K, CHUNK_SIZE_8K, CHUNK_SIZE_16K, CHUNK_SIZE_32K,
+    CHUNK_SIZE_64K, DEFAULT_CHUNK_BYTES, DefaultSlabConfig, SlabListConfig, TrConfig,
+};
 pub use tree_error_::TreeError;

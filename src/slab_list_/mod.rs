@@ -8,9 +8,14 @@
 //! - `chunk_`：Chunk 头、槽位布局与底层内存操作；
 //! - `list_`：Chunk 链表、外部 allocator 与 arena 的公开操作。
 //!
-//! 本模块是 crate 私有实现；向 crate 内其他模块导出 [`SlabList`]、
-//! [`SlabListError`]、[`SlotPtr`] 以及使用内置配置的 [`DefaultSlabList`] 别名。
-//! `ChunkLayout`、`TrConfig` 等保持为子模块内部细节。
+//! `SlabList::remove` 在 Chunk 完全空闲时会尝试把它归还给 allocator：唯一
+//! Chunk 保留，只有当前 Chunk 的前驱或后继也完全空闲时才摘链释放。这是一次
+//! 局部的回收决策，不保证链表中绝对不存在相邻的空闲 Chunk。
+//!
+//! 本模块是 crate 私有实现；`SlabList`、`SlabListError`、`SlotPtr` 与
+//! `ChunkLayout` 保持 crate 内部。配置抽象 [`TrConfig`]、内置配置
+//! [`SlabListConfig`]、默认别名 [`DefaultSlabConfig`] 与
+//! [`DEFAULT_CHUNK_BYTES`] 通过 crate 根公开给使用者。
 
 mod chunk_;
 mod config_;
@@ -18,15 +23,11 @@ mod error_;
 mod list_;
 mod ptr_;
 
-use config_::{DEFAULT_CHUNK_BYTES, SlabListConfig};
-use list_::SlabList;
+pub use config_::{
+    CHUNK_SIZE_1K, CHUNK_SIZE_2K, CHUNK_SIZE_4K, CHUNK_SIZE_8K, CHUNK_SIZE_16K, CHUNK_SIZE_32K,
+    CHUNK_SIZE_64K, DEFAULT_CHUNK_BYTES, DefaultSlabConfig, SlabListConfig, TrConfig,
+};
+pub(crate) use list_::SlabList;
 
-/// 使用内置默认配置的 `SlabList` 别名。
-///
-/// `A` 是底层 allocator 的类型；单 Chunk 大小固定为
-/// [`DEFAULT_CHUNK_BYTES`]。allocator 实例由树类型持有，并在分配/释放
-/// Chunk 时以 `&A` 的形式借给 `SlabList`。
-pub(crate) type DefaultSlabList<T, A> = SlabList<T, SlabListConfig<DEFAULT_CHUNK_BYTES, A>>;
-
-pub use error_::SlabListError;
-pub use ptr_::SlotPtr;
+pub(crate) use error_::SlabListError;
+pub(crate) use ptr_::SlotPtr;

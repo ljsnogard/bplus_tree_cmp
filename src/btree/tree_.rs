@@ -7,7 +7,8 @@
 //!
 //! - 数据直接保存在节点中，每个 `(K, V)` 只存在一份；
 //! - 节点全部由 `SlabList<Node<M, K, V>, ...>` 分配，不做逐节点堆分配；
-//! - allocator 类型由公开泛型参数 `A` 指定，默认 `Global`；
+//! - Chunk 大小与 allocator 类型由公开泛型参数 `Cfg: TrConfig` 指定；
+//!   默认是 `DefaultSlabConfig`，即 64 KiB + `Global`；
 //! - 每个节点保存 `parent_` 父指针，迭代器据此计算中序后继；
 //! - 内部节点最多 `M` 个项、`M + 1` 个孩子；
 //! - 非根节点至少 `ceil((M + 1) / 2) - 1` 个项，根节点豁免；
@@ -34,11 +35,11 @@
 //! ```
 
 use alloc::alloc::Global;
-use core::{alloc::Allocator, borrow::Borrow, mem, ops::RangeBounds};
+use core::{borrow::Borrow, mem, ops::RangeBounds};
 
 use crate::{
     comparer_::{OrdComparer, TrComparer},
-    slab_list_::DefaultSlabList,
+    slab_list_::{DefaultSlabConfig, SlabList, TrConfig},
     tree_error_::TreeError,
 };
 
@@ -54,21 +55,22 @@ use super::{
 /// 删除核心逻辑。
 ///
 /// `query_cmp` 用于与查询对象比较，`key_cmp` 用于节点内部排序。
-fn remove_entry_impl_<const M: usize, K, V, Q, QC, C, A>(
-    nodes: &mut DefaultSlabList<Node<M, K, V>, A>,
+fn remove_entry_impl_<const M: usize, K, V, Q, QC, C, Cfg>(
+    nodes: &mut SlabList<Node<M, K, V>, Cfg>,
     root: &mut Option<TreeNodePtr<M, K, V>>,
     len: &mut usize,
     query: &Q,
     query_cmp: &QC,
     key_cmp: &C,
+    allocator: &Cfg::Allocator,
 ) -> Option<(K, V)>
 where
     Q: ?Sized,
     QC: TrComparer<K, Q>,
     C: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
-    let removed = remove_entry_from_tree_(nodes, root, query, query_cmp, key_cmp);
+    let removed = remove_entry_from_tree_(nodes, root, query, query_cmp, key_cmp, allocator);
 
     if removed.is_some() {
         *len -= 1;
@@ -87,10 +89,22 @@ where
 /// - `M`：每个节点的最大项数，必须至少为 2；
 /// - `C`：定义 `K` 排序关系的 comparer 类型；
 /// - `K` / `V`：键与值类型；
-/// - `A`：内置 `SlabList` 使用的 allocator 类型，默认 [`Global`]。
+/// - `Cfg`：实现 [`TrConfig`] 的配置类型，同时指定单 Chunk 字节数和 allocator
+///   类型；默认 [`DefaultSlabConfig`]（64 KiB + [`Global`]）。
 ///
-/// 树自身持有 `A` 类型的 allocator 实例；`SlabList` 只在分配/释放 Chunk 时
-/// 借用 `&A`，因此不要求 `A: Clone`。
+/// 树自身持有 `Cfg::Allocator` 类型的 allocator 实例；`SlabList` 只在分配/释放
+/// Chunk 时借用 `&Cfg::Allocator`，因此 allocator 不需要实现 `Clone`。
+///
+/// 自定义 Chunk 大小只需替换最后一个泛型参数，例如：
+///
+/// ```
+/// use bplustree_cmp::{BTree, OrdComparer, SlabListConfig};
+///
+/// let mut tree: BTree<4, OrdComparer<u64>, u64, u64, SlabListConfig<4096>> =
+///     BTree::new().unwrap();
+/// tree.insert(1, 10);
+/// assert_eq!(tree.get(1), Some((&1, &10)));
+/// ```
 ///
 /// # 地址稳定性
 ///
@@ -117,22 +131,22 @@ where
 /// assert_eq!(tree.get(2), Some((&2, &20)));
 /// assert_eq!(tree.first(), Some((&1, &10)));
 /// ```
-pub struct BTree<const M: usize, C, K, V = (), A = Global>
+pub struct BTree<const M: usize, C, K, V = (), Cfg = DefaultSlabConfig>
 where
     C: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     len_: usize,
     comparer_: C,
     tree_root_: Option<TreeNodePtr<M, K, V>>,
-    allocator_: A,
-    node_arena_: DefaultSlabList<Node<M, K, V>, A>,
+    allocator_: Cfg::Allocator,
+    node_arena_: SlabList<Node<M, K, V>, Cfg>,
 }
 
-impl<const M: usize, C, K, V, A> Drop for BTree<M, C, K, V, A>
+impl<const M: usize, C, K, V, Cfg> Drop for BTree<M, C, K, V, Cfg>
 where
     C: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     fn drop(&mut self) {
         // SlabList 不持有 allocator，必须在 allocator 仍然存活时归还 Chunk。
@@ -140,10 +154,10 @@ where
     }
 }
 
-impl<const M: usize, C, K, V, A> BTree<M, C, K, V, A>
+impl<const M: usize, C, K, V, Cfg> BTree<M, C, K, V, Cfg>
 where
     C: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     /// 返回节点最大项数 `M`。
     ///
@@ -156,15 +170,15 @@ where
     /// 使用给定 comparer 和 allocator 创建空树。
     ///
     /// `SlabList` 在分配/释放 Chunk 时按需借用 allocator，因此不要求
-    /// `A: Clone`。
-    fn new_with_allocator_(comparer: C, allocator: A) -> Result<Self, TreeError> {
+    /// allocator 不需要实现 `Clone`。
+    fn new_with_allocator_(comparer: C, allocator: Cfg::Allocator) -> Result<Self, TreeError> {
         assert!(M >= 2, "B 树的节点容量 M 必须至少为 2");
         Ok(Self {
             len_: 0,
             comparer_: comparer,
             tree_root_: Option::None,
             allocator_: allocator,
-            node_arena_: DefaultSlabList::new().map_err(TreeError::from_slab_)?,
+            node_arena_: SlabList::new().map_err(TreeError::from_slab_)?,
         })
     }
 
@@ -410,6 +424,7 @@ where
             query_ref,
             &self.comparer_,
             &self.comparer_,
+            &self.allocator_,
         )
     }
 
@@ -438,12 +453,14 @@ where
             query,
             cmp,
             &self.comparer_,
+            &self.allocator_,
         )
     }
 
     /// 返回按 key 升序迭代的迭代器。
     ///
-    /// B 树数据分散在所有节点中，因此迭代器需要一条按树高分配的临时工作栈。
+    /// B 树数据分散在所有节点中；迭代器利用节点中的父指针计算中序后继，
+    /// 不需要工作栈或额外堆分配。
     ///
     /// # Examples
     ///
@@ -699,17 +716,18 @@ where
     }
 }
 
-impl<const M: usize, K, V> BTree<M, OrdComparer<K>, K, V, Global>
+impl<const M: usize, K, V, Cfg> BTree<M, OrdComparer<K>, K, V, Cfg>
 where
     K: Ord,
+    Cfg: TrConfig<Allocator = Global>,
 {
     /// 使用 `OrdComparer` 与 [`Global`] allocator 创建一个空树。
     ///
-    /// 这是 [`Self::new_in`] 在默认 allocator 下的便捷形式。
+    /// 这是 [`Self::new_in`] 在 `Global` allocator 下的便捷形式；`Cfg::CHUNK_SIZE` 仍由配置类型决定。
     ///
     /// # Errors
     ///
-    /// 若默认 SlabList 配置无法容纳至少一个节点，返回 [`TreeError`]。
+    /// 若当前 `Cfg::CHUNK_SIZE` 无法容纳至少一个节点，返回 [`TreeError`]。
     ///
     /// # Panics
     ///
@@ -728,19 +746,19 @@ where
     }
 }
 
-impl<const M: usize, K, V, A> BTree<M, OrdComparer<K>, K, V, A>
+impl<const M: usize, K, V, Cfg> BTree<M, OrdComparer<K>, K, V, Cfg>
 where
     K: Ord,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     /// 使用 `OrdComparer` 与给定 allocator 创建一个空树。
     ///
     /// allocator 由树自身持有；`SlabList` 在分配或释放 Chunk 时借用该
-    /// allocator，因此不要求 `A: Clone`。
+    /// allocator，因此 allocator 不需要实现 `Clone`。
     ///
     /// # Errors
     ///
-    /// 若默认 SlabList 配置无法容纳至少一个节点，返回 [`TreeError`]。
+    /// 若当前 `Cfg::CHUNK_SIZE` 无法容纳至少一个节点，返回 [`TreeError`]。
     ///
     /// # Panics
     ///
@@ -755,7 +773,7 @@ where
     /// let tree = BTree::<4, _, i32, i32>::new_in(Global).unwrap();
     /// assert!(tree.is_empty());
     /// ```
-    pub fn new_in(allocator: A) -> Result<Self, TreeError> {
+    pub fn new_in(allocator: Cfg::Allocator) -> Result<Self, TreeError> {
         Self::new_with_allocator_(OrdComparer::new(), allocator)
     }
 
@@ -778,7 +796,7 @@ where
     /// ```
     pub fn from_iter_in(
         iter: impl IntoIterator<Item = (K, V)>,
-        allocator: A,
+        allocator: Cfg::Allocator,
     ) -> Result<Self, TreeError> {
         let mut tree = Self::new_in(allocator)?;
         tree.extend(iter);
@@ -786,9 +804,10 @@ where
     }
 }
 
-impl<const M: usize, C, K, V> BTree<M, C, K, V, Global>
+impl<const M: usize, C, K, V, Cfg> BTree<M, C, K, V, Cfg>
 where
     C: TrComparer<K>,
+    Cfg: TrConfig<Allocator = Global>,
 {
     /// 使用给定 comparer 与 [`Global`] allocator 创建一个空树。
     ///
@@ -796,7 +815,7 @@ where
     ///
     /// # Errors
     ///
-    /// 若默认 SlabList 配置无法容纳至少一个节点，返回 [`TreeError`]。
+    /// 若当前 `Cfg::CHUNK_SIZE` 无法容纳至少一个节点，返回 [`TreeError`]。
     ///
     /// # Panics
     ///
@@ -845,19 +864,19 @@ where
     }
 }
 
-impl<const M: usize, C, K, V, A> BTree<M, C, K, V, A>
+impl<const M: usize, C, K, V, Cfg> BTree<M, C, K, V, Cfg>
 where
     C: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     /// 使用给定 comparer 与 allocator 创建一个空树。
     ///
     /// allocator 由树自身持有；`SlabList` 在分配或释放 Chunk 时借用该
-    /// allocator，因此不要求 `A: Clone`。
+    /// allocator，因此 allocator 不需要实现 `Clone`。
     ///
     /// # Errors
     ///
-    /// 若默认 SlabList 配置无法容纳至少一个节点，返回 [`TreeError`]。
+    /// 若当前 `Cfg::CHUNK_SIZE` 无法容纳至少一个节点，返回 [`TreeError`]。
     ///
     /// # Panics
     ///
@@ -872,7 +891,7 @@ where
     /// let tree = BTree::<4, _, i32, i32>::with_comparer_in(OrdComparer::new(), Global).unwrap();
     /// assert!(tree.is_empty());
     /// ```
-    pub fn with_comparer_in(comparer: C, allocator: A) -> Result<Self, TreeError> {
+    pub fn with_comparer_in(comparer: C, allocator: Cfg::Allocator) -> Result<Self, TreeError> {
         Self::new_with_allocator_(comparer, allocator)
     }
 
@@ -901,7 +920,7 @@ where
     pub fn from_iter_with_comparer_in(
         comparer: C,
         iter: impl IntoIterator<Item = (K, V)>,
-        allocator: A,
+        allocator: Cfg::Allocator,
     ) -> Result<Self, TreeError> {
         let mut tree = Self::with_comparer_in(comparer, allocator)?;
         tree.extend(iter);
@@ -950,10 +969,10 @@ impl<'a, K, V> ConflictInfo<'a, K, V> {
     }
 }
 
-impl<const M: usize, C, K, V, A> Extend<(K, V)> for BTree<M, C, K, V, A>
+impl<const M: usize, C, K, V, Cfg> Extend<(K, V)> for BTree<M, C, K, V, Cfg>
 where
     C: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
         for (key, value) in iter {
@@ -964,11 +983,12 @@ where
 
 /// 使用 [`OrdComparer`] 与 [`Global`] allocator 从 `(K, V)` 迭代器构建树。
 ///
-/// 重复 key 保留最后出现的 value。若默认配置无法容纳节点，本实现会 panic；
+/// 重复 key 保留最后出现的 value。若当前配置无法容纳节点，本实现会 panic；
 /// 需要可失败版本时使用 [`BTree::from_iter_in`]。
-impl<const M: usize, K, V> FromIterator<(K, V)> for BTree<M, OrdComparer<K>, K, V, Global>
+impl<const M: usize, K, V, Cfg> FromIterator<(K, V)> for BTree<M, OrdComparer<K>, K, V, Cfg>
 where
     K: Ord,
+    Cfg: TrConfig<Allocator = Global>,
 {
     fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
         match Self::from_iter_in(iter, Global) {
@@ -979,10 +999,10 @@ where
 }
 
 /// 对 `&BTree` 的迭代器。
-impl<'a, const M: usize, C, K, V, A> IntoIterator for &'a BTree<M, C, K, V, A>
+impl<'a, const M: usize, C, K, V, Cfg> IntoIterator for &'a BTree<M, C, K, V, Cfg>
 where
     C: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     type Item = (&'a K, &'a V);
     type IntoIter = TreeIter<'a, M, K, V>;
@@ -993,10 +1013,10 @@ where
 }
 
 /// 对 `&mut BTree` 的迭代器。
-impl<'a, const M: usize, C, K, V, A> IntoIterator for &'a mut BTree<M, C, K, V, A>
+impl<'a, const M: usize, C, K, V, Cfg> IntoIterator for &'a mut BTree<M, C, K, V, Cfg>
 where
     C: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     type Item = (&'a K, &'a mut V);
     type IntoIter = IterMut<'a, M, K, V>;
@@ -1007,10 +1027,10 @@ where
 }
 
 #[cfg(test)]
-impl<const M: usize, C, K, V, A> BTree<M, C, K, V, A>
+impl<const M: usize, C, K, V, Cfg> BTree<M, C, K, V, Cfg>
 where
     C: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     /// 检查 B 树结构与排序不变量。
     fn check_invariants_(&self) {

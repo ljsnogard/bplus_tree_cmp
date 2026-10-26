@@ -7,7 +7,8 @@
 //!
 //! - 数据存放在 `data_arena_` 的 `SlabList<(K, V), ...>` 中；
 //! - 节点存放在 `node_arena_` 的 `SlabList<TreeNode, ...>` 中；
-//! - 两个 arena 使用的 allocator 类型由公开泛型参数 `A` 指定，默认 `Global`；
+//! - 两个 arena 使用公开泛型参数 `Cfg: TrConfig` 指定的 Chunk 大小与 allocator；
+//!   默认是 `DefaultSlabConfig`，即 64 KiB + `Global`；
 //! - 索引项为 `(子树最大 key 的 SlotPtr, 孩子指针)`；
 //! - 叶子通过 `prev` / `next` 组成有序链，树自己持有首尾叶指针；
 //! - 每个节点保存 `parent_` 父指针，插入/删除沿父链向上传播。
@@ -34,7 +35,6 @@
 
 use alloc::alloc::Global;
 use core::{
-    alloc::Allocator,
     borrow::Borrow,
     cmp::Ordering,
     iter::FusedIterator,
@@ -46,7 +46,7 @@ use core::{
 use crate::{
     comparer_::{OrdComparer, QuerySlotComparer, SlotPairKeyComparer, TrComparer},
     ordered_arr_::OrderedArray,
-    slab_list_::{DefaultSlabList, SlotPtr},
+    slab_list_::{DefaultSlabConfig, SlabList, SlotPtr, TrConfig},
     tree_error_::TreeError,
 };
 
@@ -387,16 +387,16 @@ type SplitIndexResult<const M: usize, K, V> =
     (SlotPtr<(K, V)>, SlotPtr<(K, V)>, TreeNodePtr<M, K, V>);
 
 /// 分裂一个已满的叶子，返回左右子树最大 key 的新右叶子指针，以及旧后继。
-fn split_leaf_with_<const M: usize, K, V, C, A>(
-    nodes: &mut DefaultSlabList<TreeNode<M, K, V>, A>,
+fn split_leaf_with_<const M: usize, K, V, C, Cfg>(
+    nodes: &mut SlabList<TreeNode<M, K, V>, Cfg>,
     leaf_ptr: TreeNodePtr<M, K, V>,
     pending: SlotPtr<(K, V)>,
     cmp: &C,
-    allocator: &A,
+    allocator: &Cfg::Allocator,
 ) -> SplitLeafResult<M, K, V>
 where
     C: TrComparer<SlotPtr<(K, V)>>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     let old_next = match unsafe { node_ref_(leaf_ptr) }.as_leaf_() {
         Option::Some(leaf) => leaf.next_sibl_,
@@ -447,16 +447,16 @@ where
 }
 
 /// 分裂一个已满的索引节点，返回左右子树最大 key 与新右索引指针。
-fn split_index_with_<const M: usize, K, V, C, A>(
-    nodes: &mut DefaultSlabList<TreeNode<M, K, V>, A>,
+fn split_index_with_<const M: usize, K, V, C, Cfg>(
+    nodes: &mut SlabList<TreeNode<M, K, V>, Cfg>,
     index_ptr: TreeNodePtr<M, K, V>,
     pending: (SlotPtr<(K, V)>, TreeNodePtr<M, K, V>),
     cmp: &C,
-    allocator: &A,
+    allocator: &Cfg::Allocator,
 ) -> SplitIndexResult<M, K, V>
 where
     C: TrComparer<SlotPtr<(K, V)>>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     let (left_max, right_max, right_arr) = {
         let index = match unsafe { node_mut_(index_ptr) }.as_index_mut_() {
@@ -491,18 +491,18 @@ where
 
 /// 用两个 `(separator, child)` 项创建新的索引 root。
 #[allow(clippy::too_many_arguments)]
-fn create_root_with_two_<const M: usize, K, V, C, A>(
-    nodes: &mut DefaultSlabList<TreeNode<M, K, V>, A>,
+fn create_root_with_two_<const M: usize, K, V, C, Cfg>(
+    nodes: &mut SlabList<TreeNode<M, K, V>, Cfg>,
     root: &mut Option<TreeNodePtr<M, K, V>>,
     left_ptr: TreeNodePtr<M, K, V>,
     left_max: SlotPtr<(K, V)>,
     right_ptr: TreeNodePtr<M, K, V>,
     right_max: SlotPtr<(K, V)>,
     cmp: &C,
-    allocator: &A,
+    allocator: &Cfg::Allocator,
 ) where
     C: TrComparer<SlotPtr<(K, V)>>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     let mut index = IndexNode::new_();
     let result = index
@@ -523,17 +523,17 @@ fn create_root_with_two_<const M: usize, K, V, C, A>(
 /// 把新数据句柄插入树中；数据本身已经写入 data arena。
 ///
 /// 该函数负责叶子插入、分裂、沿父指针向上传播以及根分裂。
-fn insert_data_into_tree_<const M: usize, K, V, C, A>(
-    nodes: &mut DefaultSlabList<TreeNode<M, K, V>, A>,
+fn insert_data_into_tree_<const M: usize, K, V, C, Cfg>(
+    nodes: &mut SlabList<TreeNode<M, K, V>, Cfg>,
     root: &mut Option<TreeNodePtr<M, K, V>>,
     last_leaf: &mut Option<TreeNodePtr<M, K, V>>,
     leaf_ptr: TreeNodePtr<M, K, V>,
     data_ptr: SlotPtr<(K, V)>,
     cmp: &C,
-    allocator: &A,
+    allocator: &Cfg::Allocator,
 ) where
     C: TrComparer<SlotPtr<(K, V)>>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     let leaf_len = node_len_(leaf_ptr);
     debug_assert!(leaf_len <= M);
@@ -729,15 +729,16 @@ fn unlink_leaf_<const M: usize, K, V>(
 }
 
 /// 把 root 收缩为它唯一的孩子。
-fn collapse_root_to_child_<const M: usize, K, V, A>(
-    nodes: &mut DefaultSlabList<TreeNode<M, K, V>, A>,
+fn collapse_root_to_child_<const M: usize, K, V, Cfg>(
+    nodes: &mut SlabList<TreeNode<M, K, V>, Cfg>,
     root: &mut Option<TreeNodePtr<M, K, V>>,
     first_leaf: &mut Option<TreeNodePtr<M, K, V>>,
     last_leaf: &mut Option<TreeNodePtr<M, K, V>>,
     root_ptr: TreeNodePtr<M, K, V>,
     child_ptr: TreeNodePtr<M, K, V>,
+    allocator: &Cfg::Allocator,
 ) where
-    A: Allocator,
+    Cfg: TrConfig,
 {
     let mut old_root = root_ptr;
     let mut child = child_ptr;
@@ -745,7 +746,7 @@ fn collapse_root_to_child_<const M: usize, K, V, A>(
     loop {
         *root = Option::Some(child);
         node_set_parent_(child, Option::None);
-        let _ = nodes.remove(old_root);
+        let _ = nodes.remove(old_root, allocator);
 
         if node_is_leaf_(child) {
             *first_leaf = Option::Some(child);
@@ -768,16 +769,17 @@ fn collapse_root_to_child_<const M: usize, K, V, A>(
 }
 
 /// 清空树的 root 与首尾叶指针，并释放 root 节点。
-fn clear_root_<const M: usize, K, V, A>(
-    nodes: &mut DefaultSlabList<TreeNode<M, K, V>, A>,
+fn clear_root_<const M: usize, K, V, Cfg>(
+    nodes: &mut SlabList<TreeNode<M, K, V>, Cfg>,
     root: &mut Option<TreeNodePtr<M, K, V>>,
     first_leaf: &mut Option<TreeNodePtr<M, K, V>>,
     last_leaf: &mut Option<TreeNodePtr<M, K, V>>,
     root_ptr: TreeNodePtr<M, K, V>,
+    allocator: &Cfg::Allocator,
 ) where
-    A: Allocator,
+    Cfg: TrConfig,
 {
-    let _ = nodes.remove(root_ptr);
+    let _ = nodes.remove(root_ptr, allocator);
     *root = Option::None;
     *first_leaf = Option::None;
     *last_leaf = Option::None;
@@ -788,17 +790,19 @@ fn clear_root_<const M: usize, K, V, A>(
 /// 从 `current_ptr` 开始沿父指针向上修复。`current_max` 是当前节点子树的
 /// 最大 key；当前节点已经是 root 时，本函数也负责根收缩。
 #[allow(clippy::collapsible_if)] // 保留“先左后右”的借位语义，避免 let-chain 降低可读性
-fn rebalance_after_remove_<const M: usize, K, V, C, A>(
-    nodes: &mut DefaultSlabList<TreeNode<M, K, V>, A>,
+#[allow(clippy::too_many_arguments)] // 根、首尾叶、当前节点、sep、comparer 与 allocator 都是必要上下文
+fn rebalance_after_remove_<const M: usize, K, V, C, Cfg>(
+    nodes: &mut SlabList<TreeNode<M, K, V>, Cfg>,
     root: &mut Option<TreeNodePtr<M, K, V>>,
     first_leaf: &mut Option<TreeNodePtr<M, K, V>>,
     last_leaf: &mut Option<TreeNodePtr<M, K, V>>,
     mut current_ptr: TreeNodePtr<M, K, V>,
     mut current_max: Option<SlotPtr<(K, V)>>,
     cmp: &C,
+    allocator: &Cfg::Allocator,
 ) where
     C: TrComparer<SlotPtr<(K, V)>>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     let min = min_occupancy_(M);
 
@@ -813,13 +817,13 @@ fn rebalance_after_remove_<const M: usize, K, V, C, A>(
             if is_leaf {
                 if node_len == 0 {
                     unlink_leaf_(current_ptr, first_leaf, last_leaf);
-                    clear_root_(nodes, root, first_leaf, last_leaf, current_ptr);
+                    clear_root_(nodes, root, first_leaf, last_leaf, current_ptr, allocator);
                 }
                 return;
             }
 
             match node_len {
-                0 => clear_root_(nodes, root, first_leaf, last_leaf, current_ptr),
+                0 => clear_root_(nodes, root, first_leaf, last_leaf, current_ptr, allocator),
                 1 => {
                     let Option::Some(child_ptr) = child_at_(current_ptr, 0) else {
                         return;
@@ -831,6 +835,7 @@ fn rebalance_after_remove_<const M: usize, K, V, C, A>(
                         last_leaf,
                         current_ptr,
                         child_ptr,
+                        allocator,
                     );
                 }
                 _ => {}
@@ -849,8 +854,8 @@ fn rebalance_after_remove_<const M: usize, K, V, C, A>(
                 if node_is_leaf_(current_ptr) {
                     unlink_leaf_(current_ptr, first_leaf, last_leaf);
                 }
-                let _ = nodes.remove(current_ptr);
-                clear_root_(nodes, root, first_leaf, last_leaf, parent_ptr);
+                let _ = nodes.remove(current_ptr, allocator);
+                clear_root_(nodes, root, first_leaf, last_leaf, parent_ptr, allocator);
             } else {
                 collapse_root_to_child_(
                     nodes,
@@ -859,6 +864,7 @@ fn rebalance_after_remove_<const M: usize, K, V, C, A>(
                     last_leaf,
                     parent_ptr,
                     current_ptr,
+                    allocator,
                 );
             }
             return;
@@ -878,7 +884,7 @@ fn rebalance_after_remove_<const M: usize, K, V, C, A>(
                 if node_is_leaf_(current_ptr) {
                     unlink_leaf_(current_ptr, first_leaf, last_leaf);
                 }
-                let _ = nodes.remove(current_ptr);
+                let _ = nodes.remove(current_ptr, allocator);
 
                 match unsafe { node_mut_(parent_ptr) }.as_index_mut_() {
                     Option::Some(parent) => {
@@ -907,7 +913,7 @@ fn rebalance_after_remove_<const M: usize, K, V, C, A>(
                 Option::None => return,
             }
             node_set_parent_(current_ptr, Option::Some(grand_ptr));
-            let _ = nodes.remove(parent_ptr);
+            let _ = nodes.remove(parent_ptr, allocator);
             current_max = node_max_(current_ptr);
             continue;
         }
@@ -1028,7 +1034,7 @@ fn rebalance_after_remove_<const M: usize, K, V, C, A>(
 
             move_leaf_entries_(victim, survivor, cmp);
             unlink_leaf_(victim, first_leaf, last_leaf);
-            let _ = nodes.remove(victim);
+            let _ = nodes.remove(victim, allocator);
 
             match unsafe { node_mut_(parent_ptr) }.as_index_mut_() {
                 Option::Some(parent) => {
@@ -1149,7 +1155,7 @@ fn rebalance_after_remove_<const M: usize, K, V, C, A>(
             };
 
             move_index_entries_(victim, survivor, cmp);
-            let _ = nodes.remove(victim);
+            let _ = nodes.remove(victim, allocator);
 
             match unsafe { node_mut_(parent_ptr) }.as_index_mut_() {
                 Option::Some(parent) => {
@@ -1212,10 +1218,10 @@ where
     }
 }
 
-impl<const M: usize, C, K, V, A> BPlusTree<M, C, K, V, A>
+impl<const M: usize, C, K, V, Cfg> BPlusTree<M, C, K, V, Cfg>
 where
     C: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     /// 返回节点容量 `M`。
     pub const fn degree(&self) -> usize {
@@ -1225,8 +1231,8 @@ where
     /// 使用给定 comparer 和 allocator 创建空树。
     ///
     /// 两个 arena 使用同一个 allocator 实例；`SlabList` 在分配/释放 Chunk
-    /// 时按需借用它，因此不要求 `A: Clone`。
-    fn new_with_allocator_(comparer: C, allocator: A) -> Result<Self, TreeError> {
+    /// 时按需借用它，因此 allocator 不需要实现 `Clone`。
+    fn new_with_allocator_(comparer: C, allocator: Cfg::Allocator) -> Result<Self, TreeError> {
         assert!(M >= 2, "B+ 树的节点容量 M 必须至少为 2");
         Ok(Self {
             len_: 0,
@@ -1235,8 +1241,8 @@ where
             first_leaf_: Option::None,
             last_leaf_: Option::None,
             allocator_: allocator,
-            data_arena_: DefaultSlabList::new().map_err(TreeError::from_slab_)?,
-            node_arena_: DefaultSlabList::new().map_err(TreeError::from_slab_)?,
+            data_arena_: SlabList::new().map_err(TreeError::from_slab_)?,
+            node_arena_: SlabList::new().map_err(TreeError::from_slab_)?,
         })
     }
 
@@ -1532,6 +1538,7 @@ where
             query_ref,
             &self.comparer_,
             &self.comparer_,
+            &self.allocator_,
         )
     }
 
@@ -1563,6 +1570,7 @@ where
             query,
             cmp,
             &self.comparer_,
+            &self.allocator_,
         )
     }
 
@@ -1901,17 +1909,18 @@ where
     }
 }
 
-impl<const M: usize, K, V> BPlusTree<M, OrdComparer<K>, K, V, Global>
+impl<const M: usize, K, V, Cfg> BPlusTree<M, OrdComparer<K>, K, V, Cfg>
 where
     K: Ord,
+    Cfg: TrConfig<Allocator = Global>,
 {
     /// 使用 `OrdComparer` 与 [`Global`] allocator 创建一个空树。
     ///
-    /// 这是 [`Self::new_in`] 在默认 allocator 下的便捷形式。
+    /// 这是 [`Self::new_in`] 在 `Global` allocator 下的便捷形式；`Cfg::CHUNK_SIZE` 仍由配置类型决定。
     ///
     /// # Errors
     ///
-    /// 若默认 SlabList 配置无法容纳至少一个 `(K, V)` 或树节点，返回
+    /// 若当前 `Cfg::CHUNK_SIZE` 无法容纳至少一个 `(K, V)` 或树节点，返回
     /// [`TreeError`]。
     ///
     /// # Panics
@@ -1931,20 +1940,20 @@ where
     }
 }
 
-impl<const M: usize, K, V, A> BPlusTree<M, OrdComparer<K>, K, V, A>
+impl<const M: usize, K, V, Cfg> BPlusTree<M, OrdComparer<K>, K, V, Cfg>
 where
     K: Ord,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     /// 使用 `OrdComparer` 与给定 allocator 创建一个空树。
     ///
     /// allocator 由树自身持有；数据 arena 和节点 arena 共用同一个实例。
     /// `SlabList` 在分配或释放 Chunk 时借用该 allocator，因此不要求
-    /// `A: Clone`。
+    /// allocator 不需要实现 `Clone`。
     ///
     /// # Errors
     ///
-    /// 若默认 SlabList 配置无法容纳至少一个 `(K, V)` 或树节点，返回
+    /// 若当前 `Cfg::CHUNK_SIZE` 无法容纳至少一个 `(K, V)` 或树节点，返回
     /// [`TreeError`]。
     ///
     /// # Panics
@@ -1960,7 +1969,7 @@ where
     /// let tree = BPlusTree::<4, _, i32, i32>::new_in(Global).unwrap();
     /// assert!(tree.is_empty());
     /// ```
-    pub fn new_in(allocator: A) -> Result<Self, TreeError> {
+    pub fn new_in(allocator: Cfg::Allocator) -> Result<Self, TreeError> {
         Self::new_with_allocator_(OrdComparer::new(), allocator)
     }
 
@@ -1984,7 +1993,7 @@ where
     /// ```
     pub fn from_iter_in(
         iter: impl IntoIterator<Item = (K, V)>,
-        allocator: A,
+        allocator: Cfg::Allocator,
     ) -> Result<Self, TreeError> {
         let mut tree = Self::new_in(allocator)?;
         tree.extend(iter);
@@ -1992,9 +2001,10 @@ where
     }
 }
 
-impl<const M: usize, C, K, V> BPlusTree<M, C, K, V, Global>
+impl<const M: usize, C, K, V, Cfg> BPlusTree<M, C, K, V, Cfg>
 where
     C: TrComparer<K>,
+    Cfg: TrConfig<Allocator = Global>,
 {
     /// 使用给定 comparer 与 [`Global`] allocator 创建一个空树。
     ///
@@ -2002,7 +2012,7 @@ where
     ///
     /// # Errors
     ///
-    /// 若默认 SlabList 配置无法容纳至少一个 `(K, V)` 或树节点，返回
+    /// 若当前 `Cfg::CHUNK_SIZE` 无法容纳至少一个 `(K, V)` 或树节点，返回
     /// [`TreeError`]。
     ///
     /// # Panics
@@ -2053,20 +2063,20 @@ where
     }
 }
 
-impl<const M: usize, C, K, V, A> BPlusTree<M, C, K, V, A>
+impl<const M: usize, C, K, V, Cfg> BPlusTree<M, C, K, V, Cfg>
 where
     C: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     /// 使用给定 comparer 与 allocator 创建一个空树。
     ///
     /// allocator 由树自身持有；数据 arena 和节点 arena 共用同一个实例。
     /// `SlabList` 在分配或释放 Chunk 时借用该 allocator，因此不要求
-    /// `A: Clone`。
+    /// allocator 不需要实现 `Clone`。
     ///
     /// # Errors
     ///
-    /// 若默认 SlabList 配置无法容纳至少一个 `(K, V)` 或树节点，返回
+    /// 若当前 `Cfg::CHUNK_SIZE` 无法容纳至少一个 `(K, V)` 或树节点，返回
     /// [`TreeError`]。
     ///
     /// # Panics
@@ -2083,7 +2093,7 @@ where
     ///     BPlusTree::<4, _, i32, i32>::with_comparer_in(OrdComparer::new(), Global).unwrap();
     /// assert!(tree.is_empty());
     /// ```
-    pub fn with_comparer_in(comparer: C, allocator: A) -> Result<Self, TreeError> {
+    pub fn with_comparer_in(comparer: C, allocator: Cfg::Allocator) -> Result<Self, TreeError> {
         Self::new_with_allocator_(comparer, allocator)
     }
 
@@ -2112,7 +2122,7 @@ where
     pub fn from_iter_with_comparer_in(
         comparer: C,
         iter: impl IntoIterator<Item = (K, V)>,
-        allocator: A,
+        allocator: Cfg::Allocator,
     ) -> Result<Self, TreeError> {
         let mut tree = Self::with_comparer_in(comparer, allocator)?;
         tree.extend(iter);
@@ -2124,9 +2134,9 @@ where
 ///
 /// `query_cmp` 用于与查询对象比较，`key_cmp` 用于节点内部排序。
 #[allow(clippy::too_many_arguments)]
-fn remove_entry_with_comparer_<const M: usize, K, V, Q, TyCmp, C, A>(
-    data_arena: &mut DefaultSlabList<(K, V), A>,
-    node_arena: &mut DefaultSlabList<TreeNode<M, K, V>, A>,
+fn remove_entry_with_comparer_<const M: usize, K, V, Q, TyCmp, C, Cfg>(
+    data_arena: &mut SlabList<(K, V), Cfg>,
+    node_arena: &mut SlabList<TreeNode<M, K, V>, Cfg>,
     tree_root: &mut Option<TreeNodePtr<M, K, V>>,
     first_leaf: &mut Option<TreeNodePtr<M, K, V>>,
     last_leaf: &mut Option<TreeNodePtr<M, K, V>>,
@@ -2134,12 +2144,13 @@ fn remove_entry_with_comparer_<const M: usize, K, V, Q, TyCmp, C, A>(
     query: &Q,
     query_cmp: &TyCmp,
     key_cmp: &C,
+    allocator: &Cfg::Allocator,
 ) -> Option<(K, V)>
 where
     Q: ?Sized,
     TyCmp: TrComparer<K, Q>,
     C: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     let root = (*tree_root)?;
 
@@ -2165,11 +2176,11 @@ where
     let leaf_max = node_max_(leaf_ptr);
     let node_cmp = SlotPairKeyComparer::new_(key_cmp);
     rebalance_after_remove_(
-        node_arena, tree_root, first_leaf, last_leaf, leaf_ptr, leaf_max, &node_cmp,
+        node_arena, tree_root, first_leaf, last_leaf, leaf_ptr, leaf_max, &node_cmp, allocator,
     );
 
     *len -= 1;
-    Option::Some(data_arena.remove(data_ptr))
+    Option::Some(data_arena.remove(data_ptr, allocator))
 }
 
 /// 基于 Comparer 定序的 B+ Tree。
@@ -2179,35 +2190,49 @@ where
 /// - `M`：每个节点的最大项数，必须至少为 2；
 /// - `C`：定义 `K` 排序关系的 comparer 类型；
 /// - `K` / `V`：键与值类型，`K` 不需要实现 `Ord`；
-/// - `A`：内置 `SlabList` 使用的 allocator 类型，默认 [`Global`]。
+/// - `Cfg`：实现 [`TrConfig`] 的配置类型，同时指定单 Chunk 字节数和 allocator
+///   类型；默认 [`DefaultSlabConfig`]（64 KiB + [`Global`]）。
 ///
-/// 树自身持有 `A` 类型的 allocator 实例，数据 arena 与节点 arena 共用它；
-/// `SlabList` 只在分配/释放 Chunk 时借用 `&A`，因此不要求 `A: Clone`。
+/// 树自身持有 `Cfg::Allocator` 类型的 allocator 实例，数据 arena 与节点 arena
+/// 共用它；`SlabList` 只在分配/释放 Chunk 时借用 `&Cfg::Allocator`，因此
+/// allocator 不需要实现 `Clone`。B+ Tree 的 data arena 与 node arena 使用同一个
+/// `Cfg::CHUNK_SIZE`。
+///
+/// 自定义 Chunk 大小只需替换最后一个泛型参数，例如：
+///
+/// ```
+/// use bplustree_cmp::{BPlusTree, OrdComparer, SlabListConfig};
+///
+/// let mut tree: BPlusTree<4, OrdComparer<u64>, u64, u64, SlabListConfig<4096>> =
+///     BPlusTree::new().unwrap();
+/// tree.insert(1, 10);
+/// assert_eq!(tree.get(1), Some((&1, &10)));
+/// ```
 ///
 /// 构造入口：
 ///
 /// - `K: Ord` 时可用 [`BPlusTree::new`] / [`BPlusTree::new_in`]；
 /// - 自定义 comparer 可用 [`BPlusTree::with_comparer`] /
 ///   [`BPlusTree::with_comparer_in`]。
-pub struct BPlusTree<const M: usize, C, K, V = (), A = Global>
+pub struct BPlusTree<const M: usize, C, K, V = (), Cfg = DefaultSlabConfig>
 where
     C: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     len_: usize,
     comparer_: C,
     tree_root_: Option<TreeNodePtr<M, K, V>>,
     first_leaf_: Option<TreeNodePtr<M, K, V>>,
     last_leaf_: Option<TreeNodePtr<M, K, V>>,
-    allocator_: A,
-    data_arena_: DefaultSlabList<(K, V), A>,
-    node_arena_: DefaultSlabList<TreeNode<M, K, V>, A>,
+    allocator_: Cfg::Allocator,
+    data_arena_: SlabList<(K, V), Cfg>,
+    node_arena_: SlabList<TreeNode<M, K, V>, Cfg>,
 }
 
-impl<const M: usize, C, K, V, A> Drop for BPlusTree<M, C, K, V, A>
+impl<const M: usize, C, K, V, Cfg> Drop for BPlusTree<M, C, K, V, Cfg>
 where
     C: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     fn drop(&mut self) {
         // SlabList 不持有 allocator，必须在 allocator 仍然存活时归还 Chunk。
@@ -2257,10 +2282,10 @@ impl<'a, K, V> ConflictInfo<'a, K, V> {
     }
 }
 
-impl<const M: usize, C, K, V, A> Extend<(K, V)> for BPlusTree<M, C, K, V, A>
+impl<const M: usize, C, K, V, Cfg> Extend<(K, V)> for BPlusTree<M, C, K, V, Cfg>
 where
     C: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
         for (key, value) in iter {
@@ -2271,11 +2296,12 @@ where
 
 /// 使用 [`OrdComparer`] 与 [`Global`] allocator 从 `(K, V)` 迭代器构建树。
 ///
-/// 重复 key 保留最后出现的 value。若默认配置无法容纳 `(K, V)` 或树节点，
+/// 重复 key 保留最后出现的 value。若当前配置无法容纳 `(K, V)` 或树节点，
 /// 本实现会 panic；需要可失败版本时使用 [`BPlusTree::from_iter_in`]。
-impl<const M: usize, K, V> FromIterator<(K, V)> for BPlusTree<M, OrdComparer<K>, K, V, Global>
+impl<const M: usize, K, V, Cfg> FromIterator<(K, V)> for BPlusTree<M, OrdComparer<K>, K, V, Cfg>
 where
     K: Ord,
+    Cfg: TrConfig<Allocator = Global>,
 {
     fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
         match Self::from_iter_in(iter, Global) {
@@ -2632,10 +2658,10 @@ impl<const M: usize, K, V> ExactSizeIterator for ValuesMut<'_, M, K, V> {}
 impl<const M: usize, K, V> FusedIterator for ValuesMut<'_, M, K, V> {}
 
 /// 对 `&BPlusTree` 的迭代器。
-impl<'a, const M: usize, C, K, V, A> IntoIterator for &'a BPlusTree<M, C, K, V, A>
+impl<'a, const M: usize, C, K, V, Cfg> IntoIterator for &'a BPlusTree<M, C, K, V, Cfg>
 where
     C: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     type Item = (&'a K, &'a V);
     type IntoIter = TreeIter<'a, M, K, V>;
@@ -2646,10 +2672,10 @@ where
 }
 
 /// 对 `&mut BPlusTree` 的迭代器。
-impl<'a, const M: usize, C, K, V, A> IntoIterator for &'a mut BPlusTree<M, C, K, V, A>
+impl<'a, const M: usize, C, K, V, Cfg> IntoIterator for &'a mut BPlusTree<M, C, K, V, Cfg>
 where
     C: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     type Item = (&'a K, &'a mut V);
     type IntoIter = IterMut<'a, M, K, V>;
@@ -2660,10 +2686,10 @@ where
 }
 
 #[cfg(test)]
-impl<const M: usize, C, K, V, A> BPlusTree<M, C, K, V, A>
+impl<const M: usize, C, K, V, Cfg> BPlusTree<M, C, K, V, Cfg>
 where
     C: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     /// 检查树结构与 separator 不变量。
     fn check_invariants_(&self) {

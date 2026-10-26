@@ -1,4 +1,4 @@
-//! 公开 allocator 泛型参数的集成测试。
+//! 公开配置/allocator 泛型参数的集成测试。
 //!
 //! 这些测试只通过 crate 根导出的类型和方法验证 allocator 行为，不访问内部
 //! `SlabList`。关键点是使用一个 **没有实现 `Clone`** 的 allocator，以证明
@@ -11,7 +11,7 @@ use core::{
 };
 use std::{alloc::Global, rc::Rc};
 
-use bplustree_cmp::{BPlusTree, BTree};
+use bplustree_cmp::{BPlusTree, BTree, DEFAULT_CHUNK_BYTES, SlabListConfig};
 
 /// 记录分配/释放次数、但故意不实现 `Clone` 的 allocator。
 struct CountingAlloc {
@@ -36,9 +36,9 @@ unsafe impl Allocator for CountingAlloc {
     }
 }
 
-/// 测试目标：验证 B+ Tree 使用公开的 allocator 泛型参数，且不要求 `A: Clone`。
-/// Test goal: Verify that B+ Tree uses the public allocator generic parameter and
-/// does not require `A: Clone`.
+/// 测试目标：验证 B+ Tree 使用公开的配置泛型参数，且不要求 allocator `Clone`。
+/// Test goal: Verify that B+ Tree uses the public configuration generic parameter and
+/// does not require the allocator to be `Clone`.
 ///
 /// 测试手段：用一个没有实现 `Clone` 的 `CountingAlloc` 通过 `new_in` 创建树，
 /// 插入足够多的元素触发内部 arena 分配 Chunk，然后让树离开作用域。
@@ -64,7 +64,8 @@ fn test_bplus_tree_uses_non_clone_allocator() {
 
     {
         let mut tree =
-            BPlusTree::<4, _, i32, i32, _>::new_in(allocator).expect("默认 SlabList 配置应当有效");
+            BPlusTree::<4, _, i32, i32, SlabListConfig<DEFAULT_CHUNK_BYTES, _>>::new_in(allocator)
+                .expect("默认 SlabList 配置应当有效");
 
         assert_eq!(allocs.get(), 0);
 
@@ -80,9 +81,9 @@ fn test_bplus_tree_uses_non_clone_allocator() {
     assert_eq!(deallocs.get(), allocs.get());
 }
 
-/// 测试目标：验证 B Tree 使用公开的 allocator 泛型参数，且不要求 `A: Clone`。
-/// Test goal: Verify that B Tree uses the public allocator generic parameter and does
-/// not require `A: Clone`.
+/// 测试目标：验证 B Tree 使用公开的配置泛型参数，且不要求 allocator `Clone`。
+/// Test goal: Verify that B Tree uses the public configuration generic parameter and
+/// does not require the allocator to be `Clone`.
 ///
 /// 测试手段：用一个没有实现 `Clone` 的 `CountingAlloc` 通过 `new_in` 创建树，
 /// 插入足够多的元素触发内部 arena 分配 Chunk，然后让树离开作用域。
@@ -108,7 +109,8 @@ fn test_btree_uses_non_clone_allocator() {
 
     {
         let mut tree =
-            BTree::<4, _, i32, i32, _>::new_in(allocator).expect("默认 SlabList 配置应当有效");
+            BTree::<4, _, i32, i32, SlabListConfig<DEFAULT_CHUNK_BYTES, _>>::new_in(allocator)
+                .expect("默认 SlabList 配置应当有效");
 
         assert_eq!(allocs.get(), 0);
 
@@ -158,7 +160,11 @@ fn test_with_comparer_in_accepts_custom_allocator() {
     };
 
     {
-        let mut tree = BPlusTree::<4, _, i32, i32, _>::with_comparer_in(ReverseComparer, allocator)
+        let mut tree =
+            BPlusTree::<4, _, i32, i32, SlabListConfig<DEFAULT_CHUNK_BYTES, _>>::with_comparer_in(
+                ReverseComparer,
+                allocator,
+            )
             .expect("默认 SlabList 配置应当有效");
 
         for key in 0..128i32 {
@@ -197,7 +203,8 @@ fn test_bplus_tree_iteration_does_not_allocate() {
 
     {
         let mut tree =
-            BPlusTree::<4, _, i32, i32, _>::new_in(allocator).expect("默认 SlabList 配置应当有效");
+            BPlusTree::<4, _, i32, i32, SlabListConfig<DEFAULT_CHUNK_BYTES, _>>::new_in(allocator)
+                .expect("默认 SlabList 配置应当有效");
         for key in 0..4096 {
             tree.insert(key, key);
         }
@@ -261,7 +268,8 @@ fn test_btree_iteration_does_not_allocate() {
 
     {
         let mut tree =
-            BTree::<4, _, i32, i32, _>::new_in(allocator).expect("默认 SlabList 配置应当有效");
+            BTree::<4, _, i32, i32, SlabListConfig<DEFAULT_CHUNK_BYTES, _>>::new_in(allocator)
+                .expect("默认 SlabList 配置应当有效");
         for key in 0..4096 {
             tree.insert(key, key);
         }
@@ -296,6 +304,110 @@ fn test_btree_iteration_does_not_allocate() {
 
         assert_eq!(allocs.get(), before);
         assert_eq!(deallocs.get(), 0);
+    }
+
+    assert_eq!(deallocs.get(), allocs.get());
+}
+
+/// 测试目标：验证 B+ Tree 在删除过程中会把完全空闲的 Chunk 归还给 allocator。
+/// Test goal: Verify that B+ Tree returns fully free chunks to the allocator during
+/// removal.
+///
+/// 测试手段：用 `CountingAlloc` 构建并填充 B+ Tree，记录分配次数后删除全部元素，
+/// 在树仍然存活时检查释放次数，最后让树离开作用域。
+/// Test method: Build and fill a B+ Tree with `CountingAlloc`, record allocations,
+/// remove every element, inspect deallocations while the tree is still alive, and let
+/// the tree go out of scope.
+///
+/// 判定标准：删除过程中至少释放一个 Chunk，但至少保留一个 Chunk；树 drop 后
+/// 总释放次数等于总分配次数。
+/// Assertions: At least one chunk is deallocated during removal while at least one is
+/// retained; after the tree is dropped, total deallocations equal total allocations.
+#[test]
+fn test_bplus_tree_returns_free_chunks_during_remove() {
+    let allocs = Rc::new(Cell::new(0));
+    let deallocs = Rc::new(Cell::new(0));
+    let allocator = CountingAlloc {
+        allocs_: Rc::clone(&allocs),
+        deallocs_: Rc::clone(&deallocs),
+    };
+
+    {
+        let mut tree =
+            BPlusTree::<4, _, i32, i32, SlabListConfig<DEFAULT_CHUNK_BYTES, _>>::new_in(allocator)
+                .expect("默认 SlabList 配置应当有效");
+        for key in 0..20_000i32 {
+            tree.insert(key, key);
+        }
+
+        let allocated = allocs.get();
+        assert!(allocated > 2, "应当至少分配多个 Chunk");
+
+        for key in 0..20_000i32 {
+            assert_eq!(tree.remove(key), Some(key));
+        }
+        assert!(tree.is_empty());
+
+        assert!(
+            deallocs.get() > 0,
+            "删除过程中应当把完全空闲的 Chunk 归还给 allocator"
+        );
+        assert!(
+            deallocs.get() < allocated,
+            "树为空时仍应保留至少一个可复用 Chunk"
+        );
+    }
+
+    assert_eq!(deallocs.get(), allocs.get());
+}
+
+/// 测试目标：验证 B Tree 在删除过程中会把完全空闲的 Chunk 归还给 allocator。
+/// Test goal: Verify that B Tree returns fully free chunks to the allocator during
+/// removal.
+///
+/// 测试手段：用 `CountingAlloc` 构建并填充 B Tree，记录分配次数后删除全部元素，
+/// 在树仍然存活时检查释放次数，最后让树离开作用域。
+/// Test method: Build and fill a B Tree with `CountingAlloc`, record allocations,
+/// remove every element, inspect deallocations while the tree is still alive, and let
+/// the tree go out of scope.
+///
+/// 判定标准：删除过程中至少释放一个 Chunk，但至少保留一个 Chunk；树 drop 后
+/// 总释放次数等于总分配次数。
+/// Assertions: At least one chunk is deallocated during removal while at least one is
+/// retained; after the tree is dropped, total deallocations equal total allocations.
+#[test]
+fn test_btree_returns_free_chunks_during_remove() {
+    let allocs = Rc::new(Cell::new(0));
+    let deallocs = Rc::new(Cell::new(0));
+    let allocator = CountingAlloc {
+        allocs_: Rc::clone(&allocs),
+        deallocs_: Rc::clone(&deallocs),
+    };
+
+    {
+        let mut tree =
+            BTree::<4, _, i32, i32, SlabListConfig<DEFAULT_CHUNK_BYTES, _>>::new_in(allocator)
+                .expect("默认 SlabList 配置应当有效");
+        for key in 0..20_000i32 {
+            tree.insert(key, key);
+        }
+
+        let allocated = allocs.get();
+        assert!(allocated > 2, "应当至少分配多个 Chunk");
+
+        for key in 0..20_000i32 {
+            assert_eq!(tree.remove(key), Some(key));
+        }
+        assert!(tree.is_empty());
+
+        assert!(
+            deallocs.get() > 0,
+            "删除过程中应当把完全空闲的 Chunk 归还给 allocator"
+        );
+        assert!(
+            deallocs.get() < allocated,
+            "树为空时仍应保留至少一个可复用 Chunk"
+        );
     }
 
     assert_eq!(deallocs.get(), allocs.get());

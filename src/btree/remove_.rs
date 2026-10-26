@@ -11,9 +11,10 @@
 //! 递归深度由 B 树的最小 fanout 保证为 `O(log n)`，因此不需要额外的 path
 //! SlabList；节点本身仍然全部由 `SlabList` 分配。
 
-use core::alloc::Allocator;
-
-use crate::{comparer_::TrComparer, slab_list_::DefaultSlabList};
+use crate::{
+    comparer_::TrComparer,
+    slab_list_::{SlabList, TrConfig},
+};
 
 use super::node_::{
     Node, NodeValue, TreeNodePtr, min_keys_, node_child_at_, node_first_child_, node_is_leaf_,
@@ -23,21 +24,22 @@ use super::node_::{
 /// 从树中删除与 `query` 等价的项。
 ///
 /// `query_cmp` 用于与查询对象比较，`key_cmp` 用于节点内部排序。
-pub(crate) fn remove_entry_from_tree_<const M: usize, K, V, Q, QC, KC, A>(
-    nodes: &mut DefaultSlabList<Node<M, K, V>, A>,
+pub(crate) fn remove_entry_from_tree_<const M: usize, K, V, Q, QC, KC, Cfg>(
+    nodes: &mut SlabList<Node<M, K, V>, Cfg>,
     root: &mut Option<TreeNodePtr<M, K, V>>,
     query: &Q,
     query_cmp: &QC,
     key_cmp: &KC,
+    allocator: &Cfg::Allocator,
 ) -> Option<(K, V)>
 where
     Q: ?Sized,
     QC: TrComparer<K, Q>,
     KC: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     let root_ptr = (*root)?;
-    let removed = remove_rec_(nodes, root_ptr, query, query_cmp, key_cmp)?;
+    let removed = remove_rec_(nodes, root_ptr, query, query_cmp, key_cmp, allocator)?;
 
     while let Option::Some(root_ptr) = *root {
         let (is_leaf, len) = {
@@ -48,7 +50,7 @@ where
 
         if is_leaf {
             if len == 0 {
-                let _ = nodes.remove(root_ptr);
+                let _ = nodes.remove(root_ptr, allocator);
                 *root = Option::None;
             }
             break;
@@ -59,7 +61,7 @@ where
         }
 
         let child = node_child_at_(root_ptr, 0);
-        let _ = nodes.remove(root_ptr);
+        let _ = nodes.remove(root_ptr, allocator);
         if let Option::Some(child_ptr) = child {
             node_set_parent_(child_ptr, Option::None);
         }
@@ -70,18 +72,19 @@ where
 }
 
 /// 在 `node_ptr` 子树中递归删除与 `query` 等价的项。
-fn remove_rec_<const M: usize, K, V, Q, QC, KC, A>(
-    nodes: &mut DefaultSlabList<Node<M, K, V>, A>,
+fn remove_rec_<const M: usize, K, V, Q, QC, KC, Cfg>(
+    nodes: &mut SlabList<Node<M, K, V>, Cfg>,
     node_ptr: TreeNodePtr<M, K, V>,
     query: &Q,
     query_cmp: &QC,
     key_cmp: &KC,
+    allocator: &Cfg::Allocator,
 ) -> Option<(K, V)>
 where
     Q: ?Sized,
     QC: TrComparer<K, Q>,
     KC: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     let found = {
         // SAFETY: node_ptr 由树维护，本块只进行只读查找。
@@ -104,7 +107,7 @@ where
 
             // 内部节点：用右子树最小项替换当前项，再从右子树删除最小项。
             let right_child = node_child_at_(node_ptr, idx + 1)?;
-            let (succ_key, succ_value) = take_min_(nodes, right_child, key_cmp)?;
+            let (succ_key, succ_value) = take_min_(nodes, right_child, key_cmp, allocator)?;
 
             let removed = {
                 // SAFETY: node_ptr 由树维护；本块内没有其他引用。
@@ -117,28 +120,29 @@ where
             };
 
             // 右子树少了一项，可能低于最小占用。
-            rebalance_child_(nodes, node_ptr, idx + 1, key_cmp);
+            rebalance_child_(nodes, node_ptr, idx + 1, key_cmp, allocator);
             Option::Some(removed)
         }
         Err(pos) => {
             // 叶子没有孩子：`child_at_` 返回 None，表示未命中。
             let child = node_child_at_(node_ptr, pos)?;
-            let removed = remove_rec_(nodes, child, query, query_cmp, key_cmp)?;
-            rebalance_child_(nodes, node_ptr, pos, key_cmp);
+            let removed = remove_rec_(nodes, child, query, query_cmp, key_cmp, allocator)?;
+            rebalance_child_(nodes, node_ptr, pos, key_cmp, allocator);
             Option::Some(removed)
         }
     }
 }
 
 /// 从 `node_ptr` 子树中取出最小项，并修复沿途的下溢。
-fn take_min_<const M: usize, K, V, KC, A>(
-    nodes: &mut DefaultSlabList<Node<M, K, V>, A>,
+fn take_min_<const M: usize, K, V, KC, Cfg>(
+    nodes: &mut SlabList<Node<M, K, V>, Cfg>,
     node_ptr: TreeNodePtr<M, K, V>,
     key_cmp: &KC,
+    allocator: &Cfg::Allocator,
 ) -> Option<(K, V)>
 where
     KC: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     let (is_leaf, first_child) = {
         // SAFETY: node_ptr 由树维护，本块只读取结构信息。
@@ -156,20 +160,21 @@ where
     }
 
     let child = first_child?;
-    let result = take_min_(nodes, child, key_cmp)?;
-    rebalance_child_(nodes, node_ptr, 0, key_cmp);
+    let result = take_min_(nodes, child, key_cmp, allocator)?;
+    rebalance_child_(nodes, node_ptr, 0, key_cmp, allocator);
     Option::Some(result)
 }
 
 /// 检查 `parent_ptr` 的第 `child_idx` 个孩子是否下溢，必要时修复。
-fn rebalance_child_<const M: usize, K, V, KC, A>(
-    nodes: &mut DefaultSlabList<Node<M, K, V>, A>,
+fn rebalance_child_<const M: usize, K, V, KC, Cfg>(
+    nodes: &mut SlabList<Node<M, K, V>, Cfg>,
     parent_ptr: TreeNodePtr<M, K, V>,
     child_idx: usize,
     key_cmp: &KC,
+    allocator: &Cfg::Allocator,
 ) where
     KC: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     let parent_len = node_len_(parent_ptr);
     let Option::Some(child_ptr) = node_child_at_(parent_ptr, child_idx) else {
@@ -202,9 +207,9 @@ fn rebalance_child_<const M: usize, K, V, KC, A>(
     }
 
     if child_idx > 0 {
-        merge_with_left_(nodes, parent_ptr, child_idx, key_cmp);
+        merge_with_left_(nodes, parent_ptr, child_idx, key_cmp, allocator);
     } else if child_idx < parent_len {
-        merge_with_right_(nodes, parent_ptr, child_idx, key_cmp);
+        merge_with_right_(nodes, parent_ptr, child_idx, key_cmp, allocator);
     }
 }
 
@@ -332,14 +337,15 @@ fn borrow_right_<const M: usize, K, V, KC>(
 }
 
 /// 把当前节点与左兄弟合并，父分隔项放在中间。
-fn merge_with_left_<const M: usize, K, V, KC, A>(
-    nodes: &mut DefaultSlabList<Node<M, K, V>, A>,
+fn merge_with_left_<const M: usize, K, V, KC, Cfg>(
+    nodes: &mut SlabList<Node<M, K, V>, Cfg>,
     parent_ptr: TreeNodePtr<M, K, V>,
     child_idx: usize,
     key_cmp: &KC,
+    allocator: &Cfg::Allocator,
 ) where
     KC: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     let Option::Some(child_ptr) = node_child_at_(parent_ptr, child_idx) else {
         return;
@@ -376,18 +382,19 @@ fn merge_with_left_<const M: usize, K, V, KC, A>(
     }
 
     drain_into_(child_ptr, left_ptr, key_cmp);
-    let _ = nodes.remove(child_ptr);
+    let _ = nodes.remove(child_ptr, allocator);
 }
 
 /// 把右兄弟并入当前节点，父分隔项放在中间。
-fn merge_with_right_<const M: usize, K, V, KC, A>(
-    nodes: &mut DefaultSlabList<Node<M, K, V>, A>,
+fn merge_with_right_<const M: usize, K, V, KC, Cfg>(
+    nodes: &mut SlabList<Node<M, K, V>, Cfg>,
     parent_ptr: TreeNodePtr<M, K, V>,
     child_idx: usize,
     key_cmp: &KC,
+    allocator: &Cfg::Allocator,
 ) where
     KC: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     let Option::Some(child_ptr) = node_child_at_(parent_ptr, child_idx) else {
         return;
@@ -424,7 +431,7 @@ fn merge_with_right_<const M: usize, K, V, KC, A>(
     }
 
     drain_into_(right_ptr, child_ptr, key_cmp);
-    let _ = nodes.remove(right_ptr);
+    let _ = nodes.remove(right_ptr, allocator);
 }
 
 /// 把 `from` 节点的全部项按顺序搬到 `to` 节点末尾。

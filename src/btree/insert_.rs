@@ -12,9 +12,12 @@
 //! 待插入项可能被上移到祖先节点，因此返回值会跟踪它最终所在的位置，
 //! 供 `try_insert*` 直接返回 `(&K, &mut V)`。
 
-use core::{alloc::Allocator, cmp::Ordering};
+use core::cmp::Ordering;
 
-use crate::{comparer_::TrComparer, slab_list_::DefaultSlabList};
+use crate::{
+    comparer_::TrComparer,
+    slab_list_::{SlabList, TrConfig},
+};
 
 use super::node_::{
     Node, NodeArray, NodeEntry, NodeValue, TreeNodePtr, node_len_, node_mut_, node_parent_,
@@ -62,16 +65,16 @@ type Located<const M: usize, K, V> = (TreeNodePtr<M, K, V>, usize);
 ///
 /// 调用方必须已经确认树中不存在与 `pair` 等价的 key；本函数仍会在内部
 /// 节点命中时返回 `Err(位置)` 作为保护。
-pub(crate) fn insert_pair_into_tree_<const M: usize, K, V, C, A>(
-    nodes: &mut DefaultSlabList<Node<M, K, V>, A>,
+pub(crate) fn insert_pair_into_tree_<const M: usize, K, V, C, Cfg>(
+    nodes: &mut SlabList<Node<M, K, V>, Cfg>,
     root: &mut Option<TreeNodePtr<M, K, V>>,
     pair: (K, V),
     cmp: &C,
-    allocator: &A,
+    allocator: &Cfg::Allocator,
 ) -> Result<Located<M, K, V>, Located<M, K, V>>
 where
     C: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     let pending = (pair.0, NodeValue::new_(pair.1, Option::None));
 
@@ -108,16 +111,16 @@ where
 }
 
 /// 从 `node_ptr` 开始递归插入一项。
-fn insert_rec_<const M: usize, K, V, C, A>(
-    nodes: &mut DefaultSlabList<Node<M, K, V>, A>,
+fn insert_rec_<const M: usize, K, V, C, Cfg>(
+    nodes: &mut SlabList<Node<M, K, V>, Cfg>,
     node_ptr: TreeNodePtr<M, K, V>,
     pending: NodeEntry<M, K, V>,
     cmp: &C,
-    allocator: &A,
+    allocator: &Cfg::Allocator,
 ) -> InsertOutcome<M, K, V>
 where
     C: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     let (is_leaf, len) = {
         // SAFETY: node_ptr 由树维护，本块只读取结构信息。
@@ -234,16 +237,16 @@ where
 /// 合并后的逻辑序列有 `M + 1` 项。中间项上移，左节点保留前 `mid` 项，
 /// 新右节点保留后 `M - mid` 项。`pending` 可能位于左节点、右节点，或者
 /// 本身就是上移项。
-fn split_node_with_pending_<const M: usize, K, V, C, A>(
-    nodes: &mut DefaultSlabList<Node<M, K, V>, A>,
+fn split_node_with_pending_<const M: usize, K, V, C, Cfg>(
+    nodes: &mut SlabList<Node<M, K, V>, Cfg>,
     node_ptr: TreeNodePtr<M, K, V>,
     pending: NodeEntry<M, K, V>,
     cmp: &C,
-    allocator: &A,
+    allocator: &Cfg::Allocator,
 ) -> SplitOutcome<M, K, V>
 where
     C: TrComparer<K>,
-    A: Allocator,
+    Cfg: TrConfig,
 {
     debug_assert_eq!(node_len_(node_ptr), M);
 

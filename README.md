@@ -22,7 +22,7 @@ BPlusTreeCmp 的核心思想很简单：
 * **同一个数据类型可以建立多种不同的排序索引**
 * **数据、索引结构与排序关系彼此解耦**
 * **SlabList 对 B+ Tree 与 B Tree 隐藏了具体的存储实现**
-* **两棵树都公开 `A = Global` allocator 泛型参数，SlabList 不要求 allocator `Clone`**
+* **两棵树都公开 `Cfg: TrConfig` 泛型参数，可同时选择 Chunk 大小与 allocator；SlabList 不要求 allocator `Clone`**
 * **提供 `range` / `range_mut` / `iter_mut` / `keys` / `values_mut` 等与 `BTreeMap` 对应的迭代 API，且不引入临时堆分配**
 
 ---
@@ -310,7 +310,7 @@ B 树的数据分散在所有层级，无法像 B+ 树一样沿叶子链迭代�
 
 | B+ Tree | B Tree |
 | --- | --- |
-| `BPlusTree::<M, C, K, V, A = Global>` | `BTree::<M, C, K, V, A = Global>` |
+| `BPlusTree::<M, C, K, V, Cfg = DefaultSlabConfig>` | `BTree::<M, C, K, V, Cfg = DefaultSlabConfig>` |
 | `ConflictInfo` / `TreeIter` | `BTreeConflictInfo` / `BTreeIter` |
 | `IterMut` / `RangeIter` / `RangeIterMut` / `Keys` / `Values` / `ValuesMut` | `BTreeIterMut` / `BTreeRangeIter` / `BTreeRangeIterMut` / `BTreeKeys` / `BTreeValues` / `BTreeValuesMut` |
 | `new` / `new_in` / `degree` / `len` / `is_empty` / `comparer` | 同名 |
@@ -338,10 +338,11 @@ B+ Tree 使用 `SlabList<T, C>` 保存数据 `(K, V)` 和树节点 `TreeNode`；
 
 树看到的只是 `SlabList<T, C>`、`SlotPtr<T>`，以及 `*slot_ptr`、`&mut *slot_ptr` 这样的基本操作。
 
-配置类型 `C` 指定单 Chunk 的 const 大小和 allocator 类型；allocator 实例由树自己保存，
-`SlabList` 在分配/释放 Chunk 时按需借用 `&A`，因此不需要 `A: Clone`。两棵树默认使用
-`SlabListConfig<DEFAULT_CHUNK_BYTES, A>`，`A` 的默认值为 `Global`；单 Chunk 的
-const 大小目前固定为 `DEFAULT_CHUNK_BYTES`，尚未暴露为树的泛型参数。
+配置类型 `Cfg` 实现 `TrConfig`，同时指定单 Chunk 字节数 `CHUNK_SIZE` 和
+allocator 类型 `Allocator`；allocator 实例由树自己保存，`SlabList` 在分配/释放
+Chunk 时按需借用 `&Cfg::Allocator`，因此 allocator 不需要实现 `Clone`。两棵树默认
+使用 `DefaultSlabConfig`，即 `SlabListConfig<DEFAULT_CHUNK_BYTES, Global>`（64 KiB
+Chunk + `Global`）。B+ Tree 的 data arena 和 node arena 共用同一个 `CHUNK_SIZE`。
 
 当前结构可以概括为：
 
@@ -362,6 +363,12 @@ BTree
 ```
 
 `SlabList` 是树的存储边界；两棵树都不需要知道 Chunk 内部如何组织。
+
+`SlabList::remove` 在某个 Chunk 完全空闲时会尝试归还内存：如果它是链表中唯一
+的 Chunk，则保留；否则只要它的前驱或后继也完全空闲，就把当前 Chunk 摘链并交给
+allocator 释放。这是一次局部回收决策，不保证链表中绝对没有相邻的空 Chunk；它
+保留了“空 arena 仍可继续插入而不立即重新分配”的缓冲。释放 Chunk 需要 allocator
+实例，因此 `remove` 与 `clear` 一样按需借用 `&Cfg::Allocator`。
 
 两棵树的实现代码只允许通过 `SlabList` 进行堆分配：节点、数据（B+ Tree）和
 遍历状态都不使用 `Vec`、`Box` 等额外堆容器。B+ Tree 迭代沿叶子链，B Tree
@@ -468,26 +475,64 @@ Comparer 下已经为空（例如普通 Comparer 下的 `20..10`），则返回�
 
 ---
 
-# Allocator
+# 配置与 Allocator
 
-两棵树的公开类型都带有最后一个泛型参数 `A = Global`：
-
-```rust
-pub struct BPlusTree<const M: usize, C, K, V = (), A = Global>;
-pub struct BTree<const M: usize, C, K, V = (), A = Global>;
-```
-
-`A` 指定内置 `SlabList` 使用的底层 allocator。树自身持有 allocator 实例，内部
-arena 在分配或释放 Chunk 时借用 `&A`，因此 `A` 不需要实现 `Clone`，也不要求
-allocator 是 ZST。自定义 allocator 可通过 `new_in` / `with_comparer_in` /
-`from_iter_in` / `from_iter_with_comparer_in` 传入：
+两棵树的公开类型都带有最后一个泛型参数 `Cfg: TrConfig`：
 
 ```rust
-use bplustree_cmp::BPlusTree;
-use std::alloc::Global;
-
-let tree = BPlusTree::<4, _, u64, &str, Global>::new_in(Global).unwrap();
+pub struct BPlusTree<const M: usize, C, K, V = (), Cfg = DefaultSlabConfig>;
+pub struct BTree<const M: usize, C, K, V = (), Cfg = DefaultSlabConfig>;
 ```
+
+`Cfg` 同时指定：
+
+- 单 Chunk 的分配字节数 `Cfg::CHUNK_SIZE`；
+- 分配 Chunk 使用的 allocator 类型 `Cfg::Allocator`。
+
+树自身持有 `Cfg::Allocator` 实例，内部 arena 在分配或释放 Chunk 时借用
+`&Cfg::Allocator`，因此 allocator 不需要实现 `Clone`，也不要求是 ZST。
+`TrConfig` 是开放的 trait：使用者既可以使用内置的 `SlabListConfig`，也可以自行
+实现配置类型。
+
+只选择 Chunk 大小、继续使用 `Global`：
+
+```rust
+use bplustree_cmp::{BPlusTree, OrdComparer, SlabListConfig};
+
+type SmallTree = BPlusTree<4, OrdComparer<u64>, u64, u64, SlabListConfig<4096>>;
+
+let mut tree = SmallTree::new().unwrap();
+tree.insert(1, 10);
+assert_eq!(tree.get(1), Some((&1, &10)));
+```
+
+只替换 allocator、保持默认 64 KiB Chunk：
+
+```rust
+use bplustree_cmp::{DefaultSlabConfig, OrdComparer, BPlusTree};
+
+type TreeWithAlloc =
+    BPlusTree<4, OrdComparer<u64>, u64, u64, DefaultSlabConfig<MyAlloc>>;
+
+let tree = TreeWithAlloc::new_in(my_alloc).unwrap();
+```
+
+同时替换 Chunk 大小与 allocator：
+
+```rust
+type Tree =
+    BPlusTree<4, OrdComparer<u64>, u64, u64, SlabListConfig<4096, MyAlloc>>;
+```
+
+`CHUNK_SIZE` 是 Chunk 总分配字节数，不是“刚好容纳多少个元素”的槽位数。不同
+`T` 会得到不同槽位数；配置过小导致连一个槽位都放不下时，树构造返回
+`TreeError`。常见的 2 的幂大小（1 KiB、4 KiB、64 KiB 等）只是建议，不是限制，
+`TrConfig` 保持开放。
+
+crate 同时导出 `CHUNK_SIZE_1K`、`CHUNK_SIZE_2K`、`CHUNK_SIZE_4K`、
+`CHUNK_SIZE_8K`、`CHUNK_SIZE_16K`、`CHUNK_SIZE_32K`、`CHUNK_SIZE_64K`
+作为推荐档位，例如 `SlabListConfig<CHUNK_SIZE_4K>`。这些常量只是建议，不是
+限制；`TrConfig` 保持开放，使用者仍可实现自己的配置。
 
 ---
 
@@ -637,6 +682,7 @@ BENCH_N=500000 BENCH_SAMPLES=7 cargo bench --bench btreemap_compare
 * `new` / `new_in` / `with_comparer` / `with_comparer_in`
 * `from_iter_in` / `from_iter_with_comparer` / `from_iter_with_comparer_in`
 * `FromIterator` / `Extend` / 自定义 allocator
+* 自定义 Chunk 大小（`TrConfig` / `SlabListConfig`）
 * 异构查询，包括 `String` 与 `str`、`User` 与 `u64` 这类类型组合
 * 随机操作与结构不变量测试
 
@@ -648,10 +694,10 @@ BENCH_N=500000 BENCH_SAMPLES=7 cargo bench --bench btreemap_compare
 
 > **一种 Comparer-first、轻量索引、数据与排序关系解耦的 B+ Tree / B Tree 实现。**
 
-它仍然不是标准库 `BTreeMap` 的完全替代品：allocator 已经暴露为两棵树的泛型参数，
-但单 Chunk 大小等 SlabList 配置尚未暴露；此外也尚未提供 `Entry` API、owned
-iterator、`split_off` / `append` / `retain` / `pop_first` / `pop_last` 等更高层功能。范围查询、可变迭代与 key/value
-视图已经提供，并且都保持零临时堆分配。
+它仍然不是标准库 `BTreeMap` 的完全替代品：allocator 与单 Chunk 大小已经通过
+`Cfg: TrConfig` 暴露；此外尚未提供 `Entry` API、owned iterator、
+`split_off` / `append` / `retain` / `pop_first` / `pop_last` 等更高层功能。范围查询、
+可变迭代与 key/value 视图已经提供，并且都保持零临时堆分配。
 
 ---
 

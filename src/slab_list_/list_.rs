@@ -27,7 +27,8 @@ use super::{
 ///
 /// - 有空闲槽位的 Chunk 尽量靠近链表头部；
 /// - 已经写满的 Chunk 会被移到链表尾部；
-/// - 某个 Chunk 归还槽位后，会被移到链表头部，以便后续插入优先复用它。
+/// - 某个 Chunk 归还槽位后，通常会被移到链表头部，以便后续插入优先复用它；
+///   若它因此变成完全空闲且相邻 Chunk 也完全空闲，则可能被直接释放。
 ///
 /// 这是“空闲最多的 Chunk 在头部”的近似策略，而不是按 `free_count` 严格排序。
 /// 链表头部始终是可分配的 Chunk（如果还存在可分配 Chunk）。
@@ -38,6 +39,10 @@ use super::{
 /// - `next_free`：空闲链表中的下一个槽号，`u16::MAX` 表示链表结束。
 ///
 /// 因此槽位可以乱序归还，归还的槽位会压入所属 Chunk 的空闲链表头部。
+///
+/// 当一个 Chunk 因 `remove` 变成完全空闲时，`SlabList` 会尝试归还它的内存：
+/// 唯一 Chunk 保留；否则若前驱或后继也完全空闲，则摘链并调用 allocator 释放。
+/// 这是一次局部决策，不保证所有相邻空闲 Chunk 都在同一次操作中被回收。
 ///
 /// `T` 与配置类型 `C` 是两个独立的泛型参数：`T` 是槽位中的元素类型，`C` 是
 /// 类型级配置，决定单 Chunk 的 const 字节数和 allocator 类型。配置本身不持有
@@ -63,7 +68,7 @@ use super::{
 ///
 /// assert_eq!(*a, 10);
 /// assert_eq!(*b, 20);
-/// assert_eq!(arena.remove(a), 10);
+/// assert_eq!(arena.remove(a, &Global), 10);
 /// assert_eq!(*b, 20);
 /// arena.clear(&Global);
 /// ```
@@ -203,8 +208,18 @@ where
 
     /// 取回并归还一个槽位，返回其中原来的元素。
     ///
-    /// 槽位会被压入所属 Chunk 的空闲链表头部；同时该 Chunk 会被移到
-    /// 整个 Chunk 链表的头部，以便后续 `insert` 优先复用它。
+    /// 槽位会被压入所属 Chunk 的空闲链表头部。若该 Chunk 仍有存活元素，它会被
+    /// 移到整个 Chunk 链表的头部，以便后续 `insert` 优先复用。
+    ///
+    /// 当该 Chunk 在本 `remove` 后完全空闲时，会尝试归还它的内存：
+    ///
+    /// - 如果它是链表中唯一的 Chunk，保留它，避免下次插入重新分配；
+    /// - 否则，只要前驱或后继也是完全空闲的 Chunk，就把当前 Chunk 从链表摘下
+    ///   并通过 `allocator` 归还内存；
+    /// - 若相邻 Chunk 都不空闲，则保留当前 Chunk 并把它移到链表头部，等待复用。
+    ///
+    /// 该策略保证不会出现“只有一个空 Chunk 且被立即释放、随后插入又立刻分配”的
+    /// 抖动，同时让连续产生的空闲 Chunk 有机会归还给底层 allocator。
     ///
     /// # Panics
     ///
@@ -217,6 +232,9 @@ where
     /// 传入其他 arena 的句柄、已经悬垂的句柄或伪造的句柄属于调用方逻辑错误，
     /// 可能触发未定义行为。`SlabList` 不会扫描 Chunk 链表来验证句柄归属。
     ///
+    /// `allocator` 必须是分配该 Chunk 时使用的同一个 allocator 实例；否则
+    /// `deallocate` 的调用方契约无法满足。
+    ///
     /// # Examples
     ///
     /// ```text
@@ -227,16 +245,17 @@ where
     /// let a = arena.insert(1, &Global);
     /// let b = arena.insert(2, &Global);
     ///
-    /// assert_eq!(arena.remove(a), 1);
+    /// assert_eq!(arena.remove(a, &Global), 1);
     /// assert_eq!(*b, 2);
     /// arena.clear(&Global);
     /// ```
-    pub fn remove(&mut self, ptr: SlotPtr<T>) -> T {
+    pub fn remove(&mut self, ptr: SlotPtr<T>, allocator: &C::Allocator) -> T {
         let chunk_layout = self.chunk_layout_();
 
         // SAFETY:
         // - SlotPtr 的安全约定保证 ptr 指向本 arena 中一个已初始化的槽位。
         // - 槽位基址就是 T 的地址，因此可以 cast 回 Slot<T> 并读取元数据。
+        // - allocator 由调用方保证与分配 Chunk 时使用的是同一个实例。
         unsafe {
             let slot = ptr.as_non_null_().as_ptr().cast::<Slot<T>>();
             let self_idx = ptr::read(slot_self_idx_ptr_(slot));
@@ -264,7 +283,12 @@ where
             (*chunk).free_head_ = idx;
             (*chunk).free_count_ += 1;
 
-            self.move_to_head_(chunk);
+            if (*chunk).free_count_ < (*chunk).capacity_ {
+                self.move_to_head_(chunk);
+            } else {
+                // 刚回收的是该 Chunk 的最后一个非空闲槽位：立刻自动尝试归还。
+                self.reclaim_empty_chunk_(chunk, chunk_layout, allocator);
+            }
 
             value
         }
@@ -388,6 +412,65 @@ where
         }
     }
 
+    /// 在 Chunk 刚变为完全空闲时自动尝试归还它的内存。
+    ///
+    /// 该函数只由 [`SlabList::remove`] 在 `free_count_ == capacity_` 的那个调用
+    /// 中直接执行，不依赖任何额外的 release/shrink 方法。
+    fn reclaim_empty_chunk_(
+        &mut self,
+        chunk: *mut ChunkHeader,
+        chunk_layout: ChunkLayout,
+        allocator: &C::Allocator,
+    ) {
+        // 唯一 Chunk 必须保留，否则下一次插入会立即重新分配。
+        if self.head_ == self.tail_ {
+            return;
+        }
+
+        // SAFETY: chunk 是当前链表中有效的 Chunk，来自 remove 中刚归还完槽位的
+        // Chunk；prev_/next_ 与 free_count_/capacity_ 均由链表维护。
+        unsafe {
+            let prev = (*chunk).prev_;
+            let next = (*chunk).next_;
+            let prev_free = !prev.is_null() && (*prev).free_count_ == (*prev).capacity_;
+            let next_free = !next.is_null() && (*next).free_count_ == (*next).capacity_;
+
+            if prev_free || next_free {
+                self.unlink_chunk_(chunk);
+                dealloc_chunk_(allocator, chunk, chunk_layout.layout_);
+            } else {
+                self.move_to_head_(chunk);
+            }
+        }
+    }
+
+    /// 把 `chunk` 从 Chunk 链表中摘下，但不释放它的内存。
+    ///
+    /// 调用者必须保证 `chunk` 属于本链表，且之后要么把它重新挂回链表，要么
+    /// 通过 allocator 释放。
+    fn unlink_chunk_(&mut self, chunk: *mut ChunkHeader) {
+        // SAFETY: 调用者保证 chunk 是链表中有效的节点，prev_/next_ 一致。
+        unsafe {
+            let prev = (*chunk).prev_;
+            let next = (*chunk).next_;
+
+            if prev.is_null() {
+                self.head_ = next;
+            } else {
+                (*prev).next_ = next;
+            }
+
+            if next.is_null() {
+                self.tail_ = prev;
+            } else {
+                (*next).prev_ = prev;
+            }
+
+            (*chunk).prev_ = ptr::null_mut();
+            (*chunk).next_ = ptr::null_mut();
+        }
+    }
+
     /// 把一个 Chunk 移到链表尾部。
     ///
     /// 调用者必须保证 `chunk` 属于本链表。
@@ -477,7 +560,7 @@ where
     /// let mut arena = SlabList::<u64, SlabListConfig<4096>>::new().unwrap();
     /// let a = arena.insert(1, &Global);
     /// let _b = arena.insert(2, &Global);
-    /// arena.remove(a);
+    /// arena.remove(a, &Global);
     /// arena.clear(&Global);
     /// ```
     pub fn clear(&mut self, allocator: &C::Allocator) {
@@ -591,6 +674,9 @@ mod tests {
     /// 使用 `CountingAlloc` 的每 Chunk 2 个 `u32` 槽位配置。
     type CountingCfg2 = SlabListConfig<{ chunk_bytes_for_slots_::<u32>(2) }, CountingAlloc>;
 
+    /// 使用 `CountingAlloc` 的每 Chunk 1 个 `u32` 槽位配置。
+    type CountingCfg1 = SlabListConfig<{ chunk_bytes_for_slots_::<u32>(1) }, CountingAlloc>;
+
     /// 测试目标：验证 Chunk 字节数不足时拒绝创建 SlabList。
     /// Test goal: Verify that a chunk configuration too small for one slot is rejected.
     ///
@@ -666,14 +752,14 @@ mod tests {
         *a += 5;
         assert_eq!(*a, 15);
 
-        assert_eq!(arena.remove(b), 20);
+        assert_eq!(arena.remove(b, &Global), 20);
 
         let d = arena.insert(40, &Global);
         assert_eq!(*d, 40);
 
-        assert_eq!(arena.remove(a), 15);
-        assert_eq!(arena.remove(c), 30);
-        assert_eq!(arena.remove(d), 40);
+        assert_eq!(arena.remove(a, &Global), 15);
+        assert_eq!(arena.remove(c, &Global), 30);
+        assert_eq!(arena.remove(d, &Global), 40);
 
         let e = arena.insert(50, &Global);
         assert_eq!(*e, 50);
@@ -697,11 +783,11 @@ mod tests {
         let a = arena.insert(1, &Global);
         let b = arena.insert(2, &Global);
 
-        assert_eq!(arena.remove(a), 1);
+        assert_eq!(arena.remove(a, &Global), 1);
         let c = arena.insert(3, &Global);
         assert_eq!(a.as_ptr(), c.as_ptr());
 
-        assert_eq!(arena.remove(b), 2);
+        assert_eq!(arena.remove(b, &Global), 2);
         let d = arena.insert(4, &Global);
         assert_eq!(b.as_ptr(), d.as_ptr());
 
@@ -740,7 +826,7 @@ mod tests {
         assert_eq!(arena.chunk_count_(), 3);
         assert_eq!(arena.chunk_count_() * arena.slots_per_chunk(), 6);
 
-        assert_eq!(arena.remove(a), 0);
+        assert_eq!(arena.remove(a, &Global), 0);
         assert_eq!(arena.chunk_count_(), 3);
         assert_eq!(arena.head_free_count_(), 1);
 
@@ -752,7 +838,7 @@ mod tests {
         // f 所在的 Chunk 刚刚被移到尾部；再次释放它时，该 Chunk 应移回头部。
         // The chunk holding f was just moved to the tail; freeing it should move the
         // chunk back to the head.
-        assert_eq!(arena.remove(f), 5);
+        assert_eq!(arena.remove(f, &Global), 5);
         assert_eq!(arena.head_free_count_(), 1);
 
         let g = arena.insert(6, &Global);
@@ -761,6 +847,222 @@ mod tests {
         assert_eq!(arena.chunk_count_() * arena.slots_per_chunk(), 6);
 
         arena.clear(&Global);
+    }
+
+    /// 测试目标：验证完全空闲的 Chunk 在前驱也空闲时归还给 allocator。
+    /// Test goal: Verify that a fully free chunk is returned to the allocator when its
+    /// previous neighbor is also fully free.
+    ///
+    /// 测试手段：使用每 Chunk 1 个槽位的 `CountingAlloc` arena 插入 3 个元素，
+    /// 先释放中间元素（相邻两个 Chunk 都非空，因此保留），再释放第一个元素，
+    /// 使它的前驱是刚释放的空 Chunk；最后释放最后一个元素。
+    /// Test method: Insert three elements into a one-slot-per-chunk arena backed by
+    /// `CountingAlloc`; free the middle element first (both neighbors are non-free, so it
+    /// stays), then free the first element so its previous neighbor is the free chunk,
+    /// and finally free the last element.
+    ///
+    /// 判定标准：释放中间元素时没有 deallocate；释放第一个元素后释放次数为 1、
+    /// Chunk 数为 2；释放最后一个元素后释放次数为 2、Chunk 数为 1；`clear` 后
+    /// 总释放次数与总分配次数相等。
+    /// Assertions: No deallocation after freeing the middle element; one deallocation
+    /// and two chunks after the first; two deallocations and one chunk after the last;
+    /// after `clear`, total deallocations equal total allocations.
+    #[test]
+    fn test_reclaim_chunk_with_free_previous_neighbor() {
+        let allocs = Rc::new(Cell::new(0));
+        let deallocs = Rc::new(Cell::new(0));
+        let allocator = CountingAlloc {
+            allocs_: Rc::clone(&allocs),
+            deallocs_: Rc::clone(&deallocs),
+        };
+
+        let mut arena = SlabList::<u32, CountingCfg1>::new().expect("配置应当有效");
+
+        let a = arena.insert(1, &allocator);
+        let b = arena.insert(2, &allocator);
+        let c = arena.insert(3, &allocator);
+
+        assert_eq!(allocs.get(), 3);
+        assert_eq!(arena.chunk_count_(), 3);
+
+        // 中间 Chunk 变为完全空闲，但前后邻居都非空：保留并移到头部。
+        assert_eq!(arena.remove(b, &allocator), 2);
+        assert_eq!(deallocs.get(), 0);
+        assert_eq!(arena.chunk_count_(), 3);
+
+        // 第一个 Chunk 成为完全空闲，其前驱是刚释放的空 Chunk：归还自身。
+        assert_eq!(arena.remove(a, &allocator), 1);
+        assert_eq!(deallocs.get(), 1);
+        assert_eq!(arena.chunk_count_(), 2);
+
+        // 最后一个 Chunk 的前驱仍是保留的空 Chunk：继续归还。
+        assert_eq!(arena.remove(c, &allocator), 3);
+        assert_eq!(deallocs.get(), 2);
+        assert_eq!(arena.chunk_count_(), 1);
+
+        arena.clear(&allocator);
+        assert_eq!(deallocs.get(), 3);
+        assert_eq!(allocs.get(), 3);
+    }
+
+    /// 测试目标：验证完全空闲的 Chunk 在后继也空闲时归还给 allocator。
+    /// Test goal: Verify that a fully free chunk is returned to the allocator when its
+    /// next neighbor is also fully free.
+    ///
+    /// 测试手段：使用每 Chunk 2 个槽位的 `CountingAlloc` arena 填满两个 Chunk，
+    /// 先清空第一个 Chunk（后继仍非空，保留），再清空第二个 Chunk（后继为第一个
+    /// 空 Chunk）；随后重新插入并再次释放。
+    /// Test method: Fill two chunks in a two-slot-per-chunk arena backed by
+    /// `CountingAlloc`; clear the first chunk (its next neighbor still has live
+    /// elements, so it stays), then clear the second chunk (its next neighbor is the
+    /// free first chunk); then insert and free again.
+    ///
+    /// 判定标准：清空第一个 Chunk 后没有释放；清空第二个后释放 1 个 Chunk，
+    /// 且剩余 Chunk 仍可复用；`clear` 后释放次数等于分配次数。
+    /// Assertions: No deallocation after clearing the first chunk; one chunk is
+    /// deallocated after clearing the second; the remaining chunk is reusable; after
+    /// `clear`, deallocations equal allocations.
+    #[test]
+    fn test_reclaim_chunk_with_free_next_neighbor() {
+        let allocs = Rc::new(Cell::new(0));
+        let deallocs = Rc::new(Cell::new(0));
+        let allocator = CountingAlloc {
+            allocs_: Rc::clone(&allocs),
+            deallocs_: Rc::clone(&deallocs),
+        };
+
+        let mut arena = SlabList::<u32, CountingCfg2>::new().expect("配置应当有效");
+
+        let a0 = arena.insert(0, &allocator);
+        let a1 = arena.insert(1, &allocator);
+        let b0 = arena.insert(2, &allocator);
+        let b1 = arena.insert(3, &allocator);
+
+        assert_eq!(allocs.get(), 2);
+        assert_eq!(arena.chunk_count_(), 2);
+
+        // 第一个 Chunk 完全空闲，但后继 Chunk 仍有存活元素：保留。
+        assert_eq!(arena.remove(a0, &allocator), 0);
+        assert_eq!(arena.remove(a1, &allocator), 1);
+        assert_eq!(deallocs.get(), 0);
+        assert_eq!(arena.chunk_count_(), 2);
+
+        // 第二个 Chunk 变空，其后继是第一个空 Chunk：归还第二个 Chunk。
+        assert_eq!(arena.remove(b0, &allocator), 2);
+        assert_eq!(arena.remove(b1, &allocator), 3);
+        assert_eq!(deallocs.get(), 1);
+        assert_eq!(arena.chunk_count_(), 1);
+
+        // 剩下的空 Chunk 应继续复用，而不是重新分配。
+        let c = arena.insert(4, &allocator);
+        assert_eq!(*c, 4);
+        assert_eq!(allocs.get(), 2);
+        assert_eq!(arena.remove(c, &allocator), 4);
+        assert_eq!(deallocs.get(), 1);
+
+        arena.clear(&allocator);
+        assert_eq!(deallocs.get(), 2);
+        assert_eq!(allocs.get(), 2);
+    }
+
+    /// 测试目标：验证最后一个非空闲槽位被回收时，Chunk 在同一次 `remove` 调用中
+    /// 自动归还，不需要任何额外的 release/shrink 方法。
+    /// Test goal: Verify that when the last non-free slot is reclaimed, the chunk is
+    /// returned automatically within the same `remove` call, without any separate
+    /// release/shrink method.
+    ///
+    /// 测试手段：使用每 Chunk 2 个槽位的 `CountingAlloc` arena 填满两个 Chunk，
+    /// 先清空第一个 Chunk（后继非空，保留），再清空第二个 Chunk；第二次清空的最后
+    /// 一次 `remove` 返回后立即检查释放计数。
+    /// Test method: Fill two chunks in a two-slot-per-chunk arena backed by
+    /// `CountingAlloc`; clear the first chunk (its next neighbor is non-free, so it
+    /// stays), then clear the second chunk and check the deallocation count immediately
+    /// after the final `remove` returns.
+    ///
+    /// 判定标准：清空第一个 Chunk 时释放次数为 0；最后一个槽位归还后，无需调用
+    /// 其他方法，释放次数立即变为 1，Chunk 数立即变为 1。
+    /// Assertions: No deallocation after clearing the first chunk; immediately after the
+    /// last slot is returned, the deallocation count becomes 1 and the chunk count
+    /// becomes 1 without calling any other method.
+    #[test]
+    fn test_last_slot_removal_automatically_reclaims_chunk() {
+        let allocs = Rc::new(Cell::new(0));
+        let deallocs = Rc::new(Cell::new(0));
+        let allocator = CountingAlloc {
+            allocs_: Rc::clone(&allocs),
+            deallocs_: Rc::clone(&deallocs),
+        };
+
+        let mut arena = SlabList::<u32, CountingCfg2>::new().expect("配置应当有效");
+
+        let a0 = arena.insert(0, &allocator);
+        let a1 = arena.insert(1, &allocator);
+        let b0 = arena.insert(2, &allocator);
+        let b1 = arena.insert(3, &allocator);
+
+        assert_eq!(allocs.get(), 2);
+        assert_eq!(arena.chunk_count_(), 2);
+
+        assert_eq!(arena.remove(a0, &allocator), 0);
+        assert_eq!(arena.remove(a1, &allocator), 1);
+        assert_eq!(deallocs.get(), 0);
+        assert_eq!(arena.chunk_count_(), 2);
+
+        assert_eq!(arena.remove(b0, &allocator), 2);
+        assert_eq!(deallocs.get(), 0);
+
+        // 这是第二个 Chunk 的最后一个非空闲槽位；remove 返回时应当已经完成归还。
+        assert_eq!(arena.remove(b1, &allocator), 3);
+        assert_eq!(deallocs.get(), 1);
+        assert_eq!(arena.chunk_count_(), 1);
+
+        arena.clear(&allocator);
+        assert_eq!(deallocs.get(), 2);
+        assert_eq!(allocs.get(), 2);
+    }
+
+    /// 测试目标：验证唯一 Chunk 完全空闲时不会被释放。
+    /// Test goal: Verify that the only chunk is retained when it becomes fully free.
+    ///
+    /// 测试手段：使用每 Chunk 2 个槽位的 `CountingAlloc` arena，插入并释放全部元素；
+    /// 随后再次插入一个元素并释放，最后调用 `clear`。
+    /// Test method: Use a two-slot-per-chunk arena backed by `CountingAlloc`, insert
+    /// and free all elements, then insert and free one more, and finally call `clear`.
+    ///
+    /// 判定标准：前两轮释放都没有触发 deallocate；再次插入不增加分配次数；只有
+    /// `clear` 才释放这个唯一 Chunk。
+    /// Assertions: The first two removals do not deallocate; the next insert does not
+    /// allocate; only `clear` releases the only chunk.
+    #[test]
+    fn test_keep_only_free_chunk() {
+        let allocs = Rc::new(Cell::new(0));
+        let deallocs = Rc::new(Cell::new(0));
+        let allocator = CountingAlloc {
+            allocs_: Rc::clone(&allocs),
+            deallocs_: Rc::clone(&deallocs),
+        };
+
+        let mut arena = SlabList::<u32, CountingCfg2>::new().expect("配置应当有效");
+
+        let a = arena.insert(1, &allocator);
+        let b = arena.insert(2, &allocator);
+        assert_eq!(allocs.get(), 1);
+
+        assert_eq!(arena.remove(a, &allocator), 1);
+        assert_eq!(arena.remove(b, &allocator), 2);
+        assert_eq!(deallocs.get(), 0);
+        assert_eq!(arena.chunk_count_(), 1);
+
+        let c = arena.insert(3, &allocator);
+        assert_eq!(*c, 3);
+        assert_eq!(allocs.get(), 1);
+        assert_eq!(arena.remove(c, &allocator), 3);
+        assert_eq!(deallocs.get(), 0);
+        assert_eq!(arena.chunk_count_(), 1);
+
+        arena.clear(&allocator);
+        assert_eq!(deallocs.get(), 1);
+        assert_eq!(allocs.get(), 1);
     }
 
     /// 测试目标：验证 `clear` 只析构仍存活的元素，不会重复析构已归还槽位。
@@ -816,7 +1118,7 @@ mod tests {
             &Global,
         );
 
-        let removed = arena.remove(a);
+        let removed = arena.remove(a, &Global);
         assert_eq!(removed.value_, 1);
         drop(removed);
         assert_eq!(counter.get(), 1);
@@ -847,7 +1149,7 @@ mod tests {
         assert_ne!(a.as_ptr(), b.as_ptr());
         assert_ne!(b.as_ptr(), c.as_ptr());
 
-        assert_eq!(arena.remove(b), ());
+        assert_eq!(arena.remove(b, &Global), ());
         let d = arena.insert((), &Global);
 
         assert_eq!(d.as_ptr(), b.as_ptr());
@@ -870,10 +1172,10 @@ mod tests {
         let mut arena = SlabList::<u32, U32Cfg2>::new().expect("配置应当有效");
 
         let a = arena.insert(1, &Global);
-        assert_eq!(arena.remove(a), 1);
+        assert_eq!(arena.remove(a, &Global), 1);
 
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let _ = arena.remove(a);
+            let _ = arena.remove(a, &Global);
         }));
 
         assert!(result.is_err());
