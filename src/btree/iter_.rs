@@ -317,6 +317,77 @@ impl<const M: usize, K, V> ExactSizeIterator for ValuesMut<'_, M, K, V> {}
 
 impl<const M: usize, K, V> FusedIterator for ValuesMut<'_, M, K, V> {}
 
+// 迭代器只保存节点位置游标。不可变迭代器交出共享引用，因此发送或共享它要求
+// `K`/`V: Sync`；可变迭代器交出独占引用，发送它要求 `K`/`V: Send`，而共享
+// `&IterMut` 不能调用 `next`，因此只要求 `K`/`V: Sync`。
+//
+// SAFETY: 迭代器内部只保存指向树中仍然存活节点的句柄；树借用保证这些节点在
+// 迭代器生命周期内不会被移动或释放，跨线程移动/共享迭代器不会引入额外别名。
+unsafe impl<const M: usize, K, V> Send for TreeIter<'_, M, K, V>
+where
+    K: Sync,
+    V: Sync,
+{
+}
+
+// SAFETY: 理由同 [`TreeIter`] 的 `Send` 实现；`size_hint` 等 `&self` 操作只读。
+unsafe impl<const M: usize, K, V> Sync for TreeIter<'_, M, K, V>
+where
+    K: Sync,
+    V: Sync,
+{
+}
+
+// SAFETY: 不可变范围迭代器与 [`TreeIter`] 一样只交出共享引用。
+unsafe impl<const M: usize, K, V> Send for RangeIter<'_, M, K, V>
+where
+    K: Sync,
+    V: Sync,
+{
+}
+
+// SAFETY: `&RangeIter` 只用于读取游标和 `size_hint`，不修改树或数据。
+unsafe impl<const M: usize, K, V> Sync for RangeIter<'_, M, K, V>
+where
+    K: Sync,
+    V: Sync,
+{
+}
+
+// SAFETY: 可变迭代器拥有对不重复 value 的独占访问；跨线程移动它等同于移动
+// `&mut V`，因此要求 `K`/`V: Send`。
+unsafe impl<const M: usize, K, V> Send for IterMut<'_, M, K, V>
+where
+    K: Send,
+    V: Send,
+{
+}
+
+// SAFETY: `&IterMut` 没有可用的前进方法（`next` 需要 `&mut self`），共享引用
+// 不会产生对 value 的可变访问；`K`/`V: Sync` 足以保证 `size_hint` 等只读访问。
+unsafe impl<const M: usize, K, V> Sync for IterMut<'_, M, K, V>
+where
+    K: Sync,
+    V: Sync,
+{
+}
+
+// SAFETY: 可变范围迭代器与 [`IterMut`] 一样拥有不重复 value 的独占访问。
+unsafe impl<const M: usize, K, V> Send for RangeIterMut<'_, M, K, V>
+where
+    K: Send,
+    V: Send,
+{
+}
+
+// SAFETY: `&RangeIterMut` 只能读取游标和 `size_hint`，前进需要 `&mut self`。
+unsafe impl<const M: usize, K, V> Sync for RangeIterMut<'_, M, K, V>
+where
+    K: Sync,
+    V: Sync,
+{
+}
+
 /// 返回以 `node_ptr` 为根的最左项的 `(节点, 下标)`。
 fn leftmost_<const M: usize, K, V>(mut node_ptr: TreeNodePtr<M, K, V>) -> NodePosition<M, K, V> {
     loop {

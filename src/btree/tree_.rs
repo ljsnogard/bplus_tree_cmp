@@ -114,6 +114,13 @@ where
 /// [`crate::BPlusTree`] 把 `(K, V)` 放在独立的 Data SlabList 中，索引节点只
 /// 移动 `SlotPtr`，所以数据地址在元素被删除前保持不变。
 ///
+/// # 线程安全
+///
+/// 当 `K`、`V`、Comparer `C`、配置 `Cfg` 与 `Cfg::Allocator` 都实现 `Send` 时，
+/// 树实现 `Send`；都实现 `Sync` 时树实现 `Sync`。这与 `BTreeMap` 对
+/// `K`/`V`/allocator 的要求一致。树内部的裸指针只指向树自己拥有的 Chunk，
+/// 移动或共享树不会暴露额外的可变别名。
+///
 /// 构造入口：
 ///
 /// - `K: Ord` 时可用 [`BTree::new`] / [`BTree::new_in`]；
@@ -141,6 +148,34 @@ where
     tree_root_: Option<TreeNodePtr<M, K, V>>,
     allocator_: Cfg::Allocator,
     node_arena_: SlabList<Node<M, K, V>, Cfg>,
+}
+
+// SAFETY: `Send` 表示整棵树的独占所有权可以移动到另一个线程。树拥有的
+// `(K, V)`、Comparer 与 allocator 都要求 `Send`；node arena 中的裸指针只指向
+// 树自己持有的 Chunk，移动后仍然有效，且移动后原线程不再持有树的别名。
+// `Cfg` 不保存运行时值，但仍要求 `Send`，以保持配置类型 marker 的语义。
+unsafe impl<const M: usize, C, K, V, Cfg> Send for BTree<M, C, K, V, Cfg>
+where
+    C: TrComparer<K> + Send,
+    Cfg: TrConfig + Send,
+    Cfg::Allocator: Send,
+    K: Send,
+    V: Send,
+{
+}
+
+// SAFETY: `&BTree` 只暴露只读查询与不可变迭代；这些路径读取 Comparer、节点
+// 结构和数据，不修改 node arena。要求 `K`、`V`、Comparer、配置与 allocator
+// 都 `Sync`，保证跨线程共享时不存在未同步的可变状态。插入、删除和可变迭代
+// 需要 `&mut self`，Rust 借用规则禁止它们与共享引用同时存在。
+unsafe impl<const M: usize, C, K, V, Cfg> Sync for BTree<M, C, K, V, Cfg>
+where
+    C: TrComparer<K> + Sync,
+    Cfg: TrConfig + Sync,
+    Cfg::Allocator: Sync,
+    K: Sync,
+    V: Sync,
+{
 }
 
 impl<const M: usize, C, K, V, Cfg> Drop for BTree<M, C, K, V, Cfg>

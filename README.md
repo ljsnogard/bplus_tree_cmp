@@ -536,6 +536,26 @@ crate 同时导出 `CHUNK_SIZE_1K`、`CHUNK_SIZE_2K`、`CHUNK_SIZE_4K`、
 
 ---
 
+# 线程安全
+
+两棵树都按 `BTreeMap` 的原则实现 `Send` / `Sync`：
+
+- `Send`：`K`、`V`、Comparer `C`、配置 `Cfg` 与 `Cfg::Allocator` 都实现 `Send`；
+- `Sync`：上述类型都实现 `Sync`。
+
+树内部的 `SlotPtr` / Chunk 链表使用裸指针，但这些指针只指向树自己拥有的 Chunk。
+`Send` 移动整棵树的所有权，`Sync` 只允许通过 `&self` 做只读查询和不可变迭代；
+插入、删除和可变迭代仍然需要 `&mut self`，由 Rust 借用规则保证与共享访问互斥。
+
+公开迭代器也实现了对应的 marker：
+
+- 不可变迭代器（`TreeIter`、`RangeIter`、`Keys`、`Values`）：`Send` / `Sync`
+  要求 `K`/`V: Sync`；
+- 可变迭代器（`IterMut`、`RangeIterMut`、`ValuesMut`）：`Send` 要求
+  `K`/`V: Send`，`Sync` 要求 `K`/`V: Sync`。
+
+---
+
 # 设计原则
 
 BPlusTreeCmp 的设计可以归纳为以下原则：
@@ -683,6 +703,7 @@ BENCH_N=500000 BENCH_SAMPLES=7 cargo bench --bench btreemap_compare
 * `from_iter_in` / `from_iter_with_comparer` / `from_iter_with_comparer_in`
 * `FromIterator` / `Extend` / 自定义 allocator
 * 自定义 Chunk 大小（`TrConfig` / `SlabListConfig`）
+* 两棵树与公开迭代器的 `Send` / `Sync` marker
 * 异构查询，包括 `String` 与 `str`、`User` 与 `u64` 这类类型组合
 * 随机操作与结构不变量测试
 

@@ -2209,6 +2209,13 @@ where
 /// assert_eq!(tree.get(1), Some((&1, &10)));
 /// ```
 ///
+/// # 线程安全
+///
+/// 当 `K`、`V`、Comparer `C`、配置 `Cfg` 与 `Cfg::Allocator` 都实现 `Send` 时，
+/// 树实现 `Send`；都实现 `Sync` 时树实现 `Sync`。这与 `BTreeMap` 对
+/// `K`/`V`/allocator 的要求一致。树内部的裸指针只指向树自己拥有的 Chunk，
+/// 移动或共享树不会暴露额外的可变别名。
+///
 /// 构造入口：
 ///
 /// - `K: Ord` 时可用 [`BPlusTree::new`] / [`BPlusTree::new_in`]；
@@ -2227,6 +2234,34 @@ where
     allocator_: Cfg::Allocator,
     data_arena_: SlabList<(K, V), Cfg>,
     node_arena_: SlabList<TreeNode<M, K, V>, Cfg>,
+}
+
+// SAFETY: `Send` 表示整棵树的独占所有权可以移动到另一个线程。树拥有的
+// `(K, V)`、Comparer 与 allocator 都要求 `Send`；data/node arena 中的裸指针
+// 只指向树自己持有的 Chunk，移动后仍然有效，且移动后原线程不再持有树的别名。
+// `Cfg` 不保存运行时值，但仍要求 `Send`，以保持配置类型 marker 的语义。
+unsafe impl<const M: usize, C, K, V, Cfg> Send for BPlusTree<M, C, K, V, Cfg>
+where
+    C: TrComparer<K> + Send,
+    Cfg: TrConfig + Send,
+    Cfg::Allocator: Send,
+    K: Send,
+    V: Send,
+{
+}
+
+// SAFETY: `&BPlusTree` 只暴露只读查询与不可变迭代；这些路径读取 Comparer、
+// 节点结构和数据，不修改 arena。要求 `K`、`V`、Comparer、配置与 allocator
+// 都 `Sync`，保证跨线程共享时不存在未同步的可变状态。插入、删除和可变迭代
+// 需要 `&mut self`，Rust 借用规则禁止它们与共享引用同时存在。
+unsafe impl<const M: usize, C, K, V, Cfg> Sync for BPlusTree<M, C, K, V, Cfg>
+where
+    C: TrComparer<K> + Sync,
+    Cfg: TrConfig + Sync,
+    Cfg::Allocator: Sync,
+    K: Sync,
+    V: Sync,
+{
 }
 
 impl<const M: usize, C, K, V, Cfg> Drop for BPlusTree<M, C, K, V, Cfg>
@@ -2656,6 +2691,77 @@ impl<'a, const M: usize, K, V> Iterator for ValuesMut<'a, M, K, V> {
 impl<const M: usize, K, V> ExactSizeIterator for ValuesMut<'_, M, K, V> {}
 
 impl<const M: usize, K, V> FusedIterator for ValuesMut<'_, M, K, V> {}
+
+// 迭代器只保存节点位置和叶子链游标。不可变迭代器交出共享引用，因此发送或
+// 共享它要求 `K`/`V: Sync`；可变迭代器交出独占引用，发送它要求 `K`/`V: Send`，
+// 而共享 `&IterMut` 不能调用 `next`，因此只要求 `K`/`V: Sync`。
+//
+// SAFETY: 迭代器内部只保存指向树中仍然存活节点的句柄；树借用保证这些节点在
+// 迭代器生命周期内不会被移动或释放，跨线程移动/共享迭代器不会引入额外别名。
+unsafe impl<const M: usize, K, V> Send for TreeIter<'_, M, K, V>
+where
+    K: Sync,
+    V: Sync,
+{
+}
+
+// SAFETY: 理由同 [`TreeIter`] 的 `Send` 实现；`size_hint` 等 `&self` 操作只读。
+unsafe impl<const M: usize, K, V> Sync for TreeIter<'_, M, K, V>
+where
+    K: Sync,
+    V: Sync,
+{
+}
+
+// SAFETY: 不可变范围迭代器与 [`TreeIter`] 一样只交出共享引用。
+unsafe impl<const M: usize, K, V> Send for RangeIter<'_, M, K, V>
+where
+    K: Sync,
+    V: Sync,
+{
+}
+
+// SAFETY: `&RangeIter` 只用于读取游标和 `size_hint`，不修改树或数据。
+unsafe impl<const M: usize, K, V> Sync for RangeIter<'_, M, K, V>
+where
+    K: Sync,
+    V: Sync,
+{
+}
+
+// SAFETY: 可变迭代器拥有对不重复 value 的独占访问；跨线程移动它等同于移动
+// `&mut V`，因此要求 `K`/`V: Send`。
+unsafe impl<const M: usize, K, V> Send for IterMut<'_, M, K, V>
+where
+    K: Send,
+    V: Send,
+{
+}
+
+// SAFETY: `&IterMut` 没有可用的前进方法（`next` 需要 `&mut self`），共享引用
+// 不会产生对 value 的可变访问；`K`/`V: Sync` 足以保证 `size_hint` 等只读访问。
+unsafe impl<const M: usize, K, V> Sync for IterMut<'_, M, K, V>
+where
+    K: Sync,
+    V: Sync,
+{
+}
+
+// SAFETY: 可变范围迭代器与 [`IterMut`] 一样拥有不重复 value 的独占访问。
+unsafe impl<const M: usize, K, V> Send for RangeIterMut<'_, M, K, V>
+where
+    K: Send,
+    V: Send,
+{
+}
+
+// SAFETY: `&RangeIterMut` 只能读取游标和 `size_hint`，前进需要 `&mut self`。
+unsafe impl<const M: usize, K, V> Sync for RangeIterMut<'_, M, K, V>
+where
+    K: Sync,
+    V: Sync,
+{
+}
 
 /// 对 `&BPlusTree` 的迭代器。
 impl<'a, const M: usize, C, K, V, Cfg> IntoIterator for &'a BPlusTree<M, C, K, V, Cfg>
