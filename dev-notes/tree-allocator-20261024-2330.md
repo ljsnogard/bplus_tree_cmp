@@ -104,3 +104,8 @@ B+ Tree 有两个 arena，若要求 `A: Clone`，带状态的 allocator 会被�
 - `cargo clippy --all-targets`：0 警告；
 - `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps`：0 警告；
 - `rustfmt` 仅作用于本轮修改的文件。
+
+> 后续变更（20261026-2305）：树的最后一个泛型参数由 `A: Allocator` 改为
+> `Cfg: TrConfig`，同时指定 Chunk 大小与 allocator。`TrConfig`、
+> `SlabListConfig`、`DefaultSlabConfig`、`DEFAULT_CHUNK_BYTES` 已公开导出。
+> 详见 `dev-notes/tree-config-20261026-2305.md`。
